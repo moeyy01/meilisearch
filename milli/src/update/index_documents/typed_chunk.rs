@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::{self, BufReader};
@@ -7,7 +7,7 @@ use bytemuck::allocation::pod_collect_to_vec;
 use charabia::{Language, Script};
 use grenad::{Merger, MergerBuilder};
 use heed::types::Bytes;
-use heed::RwTxn;
+use heed::{BytesDecode, RwTxn};
 use obkv::{KvReader, KvWriter};
 use roaring::RoaringBitmap;
 
@@ -20,13 +20,16 @@ use super::MergeFn;
 use crate::external_documents_ids::{DocumentOperation, DocumentOperationKind};
 use crate::facet::FacetType;
 use crate::index::db_name::DOCUMENTS;
+use crate::proximity::MAX_DISTANCE;
 use crate::update::del_add::{deladd_serialize_add_side, DelAdd, KvReaderDelAdd};
 use crate::update::facet::FacetsUpdate;
 use crate::update::index_documents::helpers::{
     as_cloneable_grenad, keep_latest_obkv, try_split_array_at,
 };
+use crate::update::settings::InnerIndexSettingsDiff;
 use crate::{
-    lat_lng_to_xyz, DocumentId, FieldId, GeoPoint, Index, InternalError, Result, SerializationError,
+    lat_lng_to_xyz, CboRoaringBitmapCodec, DocumentId, FieldId, GeoPoint, Index, InternalError,
+    Result, SerializationError, U8StrStrCodec,
 };
 
 /// This struct accumulates and group the TypedChunks
@@ -118,80 +121,24 @@ impl TypedChunk {
     }
 }
 
-impl TypedChunk {
-    pub fn to_debug_string(&self) -> String {
-        match self {
-            TypedChunk::FieldIdDocidFacetStrings(grenad) => {
-                format!("FieldIdDocidFacetStrings {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::FieldIdDocidFacetNumbers(grenad) => {
-                format!("FieldIdDocidFacetNumbers {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::Documents(grenad) => {
-                format!("Documents {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::FieldIdWordCountDocids(grenad) => {
-                format!("FieldIdWordcountDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::WordDocids {
-                word_docids_reader,
-                exact_word_docids_reader,
-                word_fid_docids_reader,
-            } => format!(
-                "WordDocids {{ word_docids_reader: {}, exact_word_docids_reader: {}, word_fid_docids_reader: {} }}",
-                word_docids_reader.len(),
-                exact_word_docids_reader.len(),
-                word_fid_docids_reader.len()
-            ),
-            TypedChunk::WordPositionDocids(grenad) => {
-                format!("WordPositionDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::WordPairProximityDocids(grenad) => {
-                format!("WordPairProximityDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::FieldIdFacetStringDocids((grenad, _)) => {
-                format!("FieldIdFacetStringDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::FieldIdFacetNumberDocids(grenad) => {
-                format!("FieldIdFacetNumberDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::FieldIdFacetExistsDocids(grenad) => {
-                format!("FieldIdFacetExistsDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::FieldIdFacetIsNullDocids(grenad) => {
-                format!("FieldIdFacetIsNullDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::FieldIdFacetIsEmptyDocids(grenad) => {
-                format!("FieldIdFacetIsEmptyDocids {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::GeoPoints(grenad) => {
-                format!("GeoPoints {{ number_of_entries: {} }}", grenad.len())
-            }
-            TypedChunk::VectorPoints{ remove_vectors, manual_vectors, embeddings, expected_dimension, embedder_name } => {
-                format!("VectorPoints {{ remove_vectors: {}, manual_vectors: {}, embeddings: {}, dimension: {}, embedder_name: {} }}", remove_vectors.len(), manual_vectors.len(), embeddings.as_ref().map(|e| e.len()).unwrap_or_default(), expected_dimension, embedder_name)
-            }
-            TypedChunk::ScriptLanguageDocids(sl_map) => {
-                format!("ScriptLanguageDocids {{ number_of_entries: {} }}", sl_map.len())
-            }
-        }
-    }
-}
-
 /// Write typed chunk in the corresponding LMDB database of the provided index.
 /// Return new documents seen.
 #[tracing::instrument(level = "trace", skip_all, target = "indexing::write_db")]
 pub(crate) fn write_typed_chunk_into_index(
-    typed_chunks: Vec<TypedChunk>,
-    index: &Index,
     wtxn: &mut RwTxn,
+    index: &Index,
+    settings_diff: &InnerIndexSettingsDiff,
+    typed_chunks: Vec<TypedChunk>,
 ) -> Result<(RoaringBitmap, bool)> {
-    puffin::profile_function!(typed_chunks[0].to_debug_string());
-
     let mut is_merged_database = false;
     match typed_chunks[0] {
         TypedChunk::Documents(_) => {
             let span = tracing::trace_span!(target: "indexing::write_db", "documents");
             let _entered = span.enter();
+
+            let fields_ids_map = index.fields_ids_map(wtxn)?;
+            let vectors_fid =
+                fields_ids_map.id(crate::vector::parsed_vectors::RESERVED_VECTORS_FIELD_NAME);
 
             let mut builder = MergerBuilder::new(keep_latest_obkv as MergeFn);
             for typed_chunk in typed_chunks {
@@ -206,6 +153,10 @@ pub(crate) fn write_typed_chunk_into_index(
 
             let mut docids = index.documents_ids(wtxn)?;
             let mut iter = merger.into_stream_merger_iter()?;
+
+            let embedders: BTreeSet<_> =
+                index.embedding_configs(wtxn)?.into_iter().map(|(k, _v)| k).collect();
+            let mut vectors_buffer = Vec::new();
             while let Some((key, reader)) = iter.next()? {
                 let mut writer: KvWriter<_, FieldId> = KvWriter::memory();
                 let reader: KvReader<FieldId> = KvReader::new(reader);
@@ -219,7 +170,35 @@ pub(crate) fn write_typed_chunk_into_index(
                     let del_add_reader = KvReaderDelAdd::new(value);
 
                     if let Some(addition) = del_add_reader.get(DelAdd::Addition) {
-                        writer.insert(field_id, addition)?;
+                        let addition = if vectors_fid == Some(field_id) {
+                            'vectors: {
+                                vectors_buffer.clear();
+                                let Ok(mut vectors) =
+                                    crate::vector::parsed_vectors::ParsedVectors::from_bytes(
+                                        addition,
+                                    )
+                                else {
+                                    // if the `_vectors` field cannot be parsed as map of vectors, just write it as-is
+                                    break 'vectors Some(addition);
+                                };
+                                vectors.retain_user_provided_vectors(&embedders);
+                                let crate::vector::parsed_vectors::ParsedVectors(vectors) = vectors;
+                                if vectors.is_empty() {
+                                    // skip writing empty `_vectors` map
+                                    break 'vectors None;
+                                }
+
+                                serde_json::to_writer(&mut vectors_buffer, &vectors)
+                                    .map_err(InternalError::SerdeJson)?;
+                                Some(vectors_buffer.as_slice())
+                            }
+                        } else {
+                            Some(addition)
+                        };
+
+                        if let Some(addition) = addition {
+                            writer.insert(field_id, addition)?;
+                        }
                     }
                 }
 
@@ -510,13 +489,22 @@ pub(crate) fn write_typed_chunk_into_index(
             }
             let merger = builder.build();
 
-            write_entries_into_database(
-                merger,
-                &index.word_pair_proximity_docids,
-                wtxn,
-                deladd_serialize_add_side,
-                merge_deladd_cbo_roaring_bitmaps_into_cbo_roaring_bitmap,
-            )?;
+            if settings_diff.only_additional_fields.is_some() {
+                write_proximity_entries_into_database_additional_searchables(
+                    merger,
+                    &index.word_pair_proximity_docids,
+                    wtxn,
+                )?;
+            } else {
+                write_entries_into_database(
+                    merger,
+                    &index.word_pair_proximity_docids,
+                    wtxn,
+                    deladd_serialize_add_side,
+                    merge_deladd_cbo_roaring_bitmaps_into_cbo_roaring_bitmap,
+                )?;
+            }
+
             is_merged_database = true;
         }
         TypedChunk::FieldIdDocidFacetNumbers(_) => {
@@ -659,18 +647,10 @@ pub(crate) fn write_typed_chunk_into_index(
             let embedder_index = index.embedder_category_id.get(wtxn, &embedder_name)?.ok_or(
                 InternalError::DatabaseMissingEntry { db_name: "embedder_category_id", key: None },
             )?;
-            let writer_index = (embedder_index as u16) << 8;
             // FIXME: allow customizing distance
-            let writers: std::result::Result<Vec<_>, _> = (0..=u8::MAX)
-                .map(|k| {
-                    arroy::Writer::new(
-                        index.vector_arroy,
-                        writer_index | (k as u16),
-                        expected_dimension,
-                    )
-                })
+            let writers: Vec<_> = crate::vector::arroy_db_range_for_embedder(embedder_index)
+                .map(|k| arroy::Writer::new(index.vector_arroy, k, expected_dimension))
                 .collect();
-            let writers = writers?;
 
             // remove vectors for docids we want them removed
             let merger = remove_vectors_builder.build();
@@ -842,7 +822,6 @@ where
     FS: for<'a> Fn(&'a [u8], &'a mut Vec<u8>) -> Result<&'a [u8]>,
     FM: for<'a> Fn(&[u8], &[u8], &'a mut Vec<u8>) -> Result<Option<&'a [u8]>>,
 {
-    puffin::profile_function!();
     let mut buffer = Vec::new();
     let database = database.remap_types::<Bytes, Bytes>();
 
@@ -858,6 +837,54 @@ where
                 Some(value) => database.put(wtxn, key, value)?,
                 None => {
                     database.delete(wtxn, key)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Akin to the `write_entries_into_database` function but specialized
+/// for the case when we only index additional searchable fields only.
+#[tracing::instrument(level = "trace", skip_all, target = "indexing::write_db")]
+fn write_proximity_entries_into_database_additional_searchables<R>(
+    merger: Merger<R, MergeFn>,
+    database: &heed::Database<U8StrStrCodec, CboRoaringBitmapCodec>,
+    wtxn: &mut RwTxn,
+) -> Result<()>
+where
+    R: io::Read + io::Seek,
+{
+    let mut iter = merger.into_stream_merger_iter()?;
+    while let Some((key, value)) = iter.next()? {
+        if valid_lmdb_key(key) {
+            let (proximity_to_insert, word1, word2) =
+                U8StrStrCodec::bytes_decode(key).map_err(heed::Error::Decoding)?;
+            let data_to_insert = match KvReaderDelAdd::new(value).get(DelAdd::Addition) {
+                Some(value) => {
+                    CboRoaringBitmapCodec::bytes_decode(value).map_err(heed::Error::Decoding)?
+                }
+                None => continue,
+            };
+
+            let mut data_to_remove = RoaringBitmap::new();
+            for prox in 1..(MAX_DISTANCE as u8) {
+                let key = (prox, word1, word2);
+                let database_value = database.get(wtxn, &key)?.unwrap_or_default();
+                let value = if prox == proximity_to_insert {
+                    // Proximity that should be changed.
+                    // Union values and remove lower proximity data
+                    (&database_value | &data_to_insert) - &data_to_remove
+                } else {
+                    // Remove lower proximity data
+                    &database_value - &data_to_remove
+                };
+
+                // add the current data in data_to_remove for the next proximities
+                data_to_remove |= &value;
+
+                if database_value != value {
+                    database.put(wtxn, &key, &value)?;
                 }
             }
         }

@@ -24,6 +24,7 @@ pub mod facet;
 mod fst_utils;
 pub mod hybrid;
 pub mod new;
+pub mod similar;
 
 #[derive(Debug, Clone)]
 pub struct SemanticSearch {
@@ -147,21 +148,21 @@ impl<'a> Search<'a> {
 
     pub fn execute_for_candidates(&self, has_vector_search: bool) -> Result<RoaringBitmap> {
         if has_vector_search {
-            let ctx = SearchContext::new(self.index, self.rtxn);
-            filtered_universe(&ctx, &self.filter)
+            let ctx = SearchContext::new(self.index, self.rtxn)?;
+            filtered_universe(ctx.index, ctx.txn, &self.filter)
         } else {
             Ok(self.execute()?.candidates)
         }
     }
 
     pub fn execute(&self) -> Result<SearchResult> {
-        let mut ctx = SearchContext::new(self.index, self.rtxn);
+        let mut ctx = SearchContext::new(self.index, self.rtxn)?;
 
         if let Some(searchable_attributes) = self.searchable_attributes {
-            ctx.searchable_attributes(searchable_attributes)?;
+            ctx.attributes_to_search_on(searchable_attributes)?;
         }
 
-        let universe = filtered_universe(&ctx, &self.filter)?;
+        let universe = filtered_universe(ctx.index, ctx.txn, &self.filter)?;
         let PartialSearchResult {
             located_query_terms,
             candidates,
@@ -276,6 +277,8 @@ pub enum TermsMatchingStrategy {
     Last,
     // all words are mandatory
     All,
+    // remove more frequent word first
+    Frequency,
 }
 
 impl Default for TermsMatchingStrategy {
@@ -329,6 +332,30 @@ mod test {
         let mut search = Search::new(&txn, &index);
 
         search.query("東京");
+        let SearchResult { documents_ids, .. } = search.execute().unwrap();
+
+        assert_eq!(documents_ids, vec![1]);
+    }
+
+    #[cfg(feature = "korean")]
+    #[test]
+    fn test_hangul_language_detection() {
+        use crate::index::tests::TempIndex;
+
+        let index = TempIndex::new();
+
+        index
+            .add_documents(documents!([
+                { "id": 0, "title": "The quick (\"brown\") fox can't jump 32.3 feet, right? Brr, it's 29.3°F!" },
+                { "id": 1, "title": "김밥먹을래。" },
+                { "id": 2, "title": "הַשּׁוּעָל הַמָּהִיר (״הַחוּם״) לֹא יָכוֹל לִקְפֹּץ 9.94 מֶטְרִים, נָכוֹן? ברר, 1.5°C- בַּחוּץ!" }
+            ]))
+            .unwrap();
+
+        let txn = index.write_txn().unwrap();
+        let mut search = Search::new(&txn, &index);
+
+        search.query("김밥");
         let SearchResult { documents_ids, .. } = search.execute().unwrap();
 
         assert_eq!(documents_ids, vec![1]);

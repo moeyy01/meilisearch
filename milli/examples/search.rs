@@ -48,8 +48,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let start = Instant::now();
 
-            let mut ctx = SearchContext::new(&index, &txn);
-            let universe = filtered_universe(&ctx, &None)?;
+            let mut ctx = SearchContext::new(&index, &txn)?;
+            let universe = filtered_universe(ctx.index, ctx.txn, &None)?;
 
             let docs = execute_search(
                 &mut ctx,

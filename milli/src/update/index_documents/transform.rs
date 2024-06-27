@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::btree_map::Entry as BEntry;
 use std::collections::hash_map::Entry as HEntry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek};
 
@@ -21,20 +21,23 @@ use crate::documents::{DocumentsBatchIndex, EnrichedDocument, EnrichedDocumentsB
 use crate::error::{Error, InternalError, UserError};
 use crate::index::{db_name, main_key};
 use crate::update::del_add::{
-    del_add_from_two_obkvs, into_del_add_obkv, DelAdd, DelAddOperation, KvReaderDelAdd,
+    into_del_add_obkv, into_del_add_obkv_conditional_operation, DelAdd, DelAddOperation,
+    KvReaderDelAdd,
 };
 use crate::update::index_documents::GrenadParameters;
 use crate::update::settings::{InnerIndexSettings, InnerIndexSettingsDiff};
 use crate::update::{AvailableDocumentsIds, UpdateIndexingStep};
-use crate::{FieldDistribution, FieldId, FieldIdMapMissingEntry, FieldsIdsMap, Index, Result};
+use crate::{
+    is_faceted_by, FieldDistribution, FieldId, FieldIdMapMissingEntry, FieldsIdsMap, Index, Result,
+};
 
 pub struct TransformOutput {
     pub primary_key: String,
     pub settings_diff: InnerIndexSettingsDiff,
     pub field_distribution: FieldDistribution,
     pub documents_count: usize,
-    pub original_documents: File,
-    pub flattened_documents: File,
+    pub original_documents: Option<File>,
+    pub flattened_documents: Option<File>,
 }
 
 /// Extract the external ids, deduplicate and compute the new internal documents ids
@@ -48,7 +51,6 @@ pub struct Transform<'a, 'i> {
     fields_ids_map: FieldsIdsMap,
 
     indexer_settings: &'a IndexerConfig,
-    pub autogenerate_docids: bool,
     pub index_documents_method: IndexDocumentsMethod,
     available_documents_ids: AvailableDocumentsIds,
 
@@ -102,7 +104,7 @@ impl<'a, 'i> Transform<'a, 'i> {
         index: &'i Index,
         indexer_settings: &'a IndexerConfig,
         index_documents_method: IndexDocumentsMethod,
-        autogenerate_docids: bool,
+        _autogenerate_docids: bool,
     ) -> Result<Self> {
         // We must choose the appropriate merge function for when two or more documents
         // with the same user id must be merged or fully replaced in the same batch.
@@ -136,7 +138,6 @@ impl<'a, 'i> Transform<'a, 'i> {
             index,
             fields_ids_map: index.fields_ids_map(wtxn)?,
             indexer_settings,
-            autogenerate_docids,
             available_documents_ids: AvailableDocumentsIds::from_documents_ids(&documents_ids),
             original_sorter,
             flattened_sorter,
@@ -161,8 +162,6 @@ impl<'a, 'i> Transform<'a, 'i> {
         FP: Fn(UpdateIndexingStep) + Sync,
         FA: Fn() -> bool + Sync,
     {
-        puffin::profile_function!();
-
         let (mut cursor, fields_index) = reader.into_cursor_and_fields_index();
         let external_documents_ids = self.index.external_documents_ids();
         let mapping = create_fields_mapping(&mut self.fields_ids_map, &fields_index)?;
@@ -375,8 +374,6 @@ impl<'a, 'i> Transform<'a, 'i> {
     where
         FA: Fn() -> bool + Sync,
     {
-        puffin::profile_function!();
-
         // there may be duplicates in the documents to remove.
         to_remove.sort_unstable();
         to_remove.dedup();
@@ -466,8 +463,6 @@ impl<'a, 'i> Transform<'a, 'i> {
     where
         FA: Fn() -> bool + Sync,
     {
-        puffin::profile_function!();
-
         let mut documents_deleted = 0;
         let mut document_sorter_value_buffer = Vec::new();
         let mut document_sorter_key_buffer = Vec::new();
@@ -686,8 +681,6 @@ impl<'a, 'i> Transform<'a, 'i> {
     where
         F: Fn(UpdateIndexingStep) + Sync,
     {
-        puffin::profile_function!();
-
         let primary_key = self
             .index
             .primary_key(wtxn)?
@@ -808,24 +801,32 @@ impl<'a, 'i> Transform<'a, 'i> {
         })?;
 
         let old_inner_settings = InnerIndexSettings::from_index(self.index, wtxn)?;
+        let fields_ids_map = self.fields_ids_map;
+        let primary_key_id = self.index.primary_key(wtxn)?.and_then(|name| fields_ids_map.id(name));
         let mut new_inner_settings = old_inner_settings.clone();
-        new_inner_settings.fields_ids_map = self.fields_ids_map;
-        let settings_diff = InnerIndexSettingsDiff {
-            old: old_inner_settings,
-            new: new_inner_settings,
-            embedding_configs_updated: false,
-            settings_update_only: false,
-        };
+        new_inner_settings.fields_ids_map = fields_ids_map;
+
+        let embedding_configs_updated = false;
+        let settings_update_only = false;
+        let settings_diff = InnerIndexSettingsDiff::new(
+            old_inner_settings,
+            new_inner_settings,
+            primary_key_id,
+            embedding_configs_updated,
+            settings_update_only,
+        );
 
         Ok(TransformOutput {
             primary_key,
             settings_diff,
             field_distribution,
             documents_count: self.documents_count,
-            original_documents: original_documents.into_inner().map_err(|err| err.into_error())?,
-            flattened_documents: flattened_documents
-                .into_inner()
-                .map_err(|err| err.into_error())?,
+            original_documents: Some(
+                original_documents.into_inner().map_err(|err| err.into_error())?,
+            ),
+            flattened_documents: Some(
+                flattened_documents.into_inner().map_err(|err| err.into_error())?,
+            ),
         })
     }
 
@@ -835,34 +836,59 @@ impl<'a, 'i> Transform<'a, 'i> {
     fn rebind_existing_document(
         old_obkv: KvReader<FieldId>,
         settings_diff: &InnerIndexSettingsDiff,
-        original_obkv_buffer: &mut Vec<u8>,
-        flattened_obkv_buffer: &mut Vec<u8>,
+        modified_faceted_fields: &HashSet<String>,
+        original_obkv_buffer: Option<&mut Vec<u8>>,
+        flattened_obkv_buffer: Option<&mut Vec<u8>>,
     ) -> Result<()> {
-        let mut old_fields_ids_map = settings_diff.old.fields_ids_map.clone();
-        let mut new_fields_ids_map = settings_diff.new.fields_ids_map.clone();
+        // Always keep the primary key.
+        let is_primary_key = |id: FieldId| -> bool { settings_diff.primary_key_id == Some(id) };
+
+        // If only a faceted field has been added, keep only this field.
+        let must_reindex_facets = settings_diff.reindex_facets();
+        let necessary_faceted_field = |id: FieldId| -> bool {
+            let field_name = settings_diff.new.fields_ids_map.name(id).unwrap();
+            must_reindex_facets
+                && modified_faceted_fields
+                    .iter()
+                    .any(|long| is_faceted_by(long, field_name) || is_faceted_by(field_name, long))
+        };
+
+        // Alway provide all fields when vectors are involved because
+        // we need the fields for the prompt/templating.
+        let reindex_vectors = settings_diff.reindex_vectors();
+
+        // The operations that we must perform on the different fields.
+        let mut operations = HashMap::new();
+
         let mut obkv_writer = KvWriter::<_, FieldId>::memory();
-        // We iterate over the new `FieldsIdsMap` ids in order and construct the new obkv.
-        for (id, name) in new_fields_ids_map.iter() {
-            if let Some(val) = old_fields_ids_map.id(name).and_then(|id| old_obkv.get(id)) {
+        for (id, val) in old_obkv.iter() {
+            if is_primary_key(id) || necessary_faceted_field(id) || reindex_vectors {
+                operations.insert(id, DelAddOperation::DeletionAndAddition);
+                obkv_writer.insert(id, val)?;
+            } else if let Some(operation) = settings_diff.reindex_searchable_id(id) {
+                operations.insert(id, operation);
                 obkv_writer.insert(id, val)?;
             }
         }
         let data = obkv_writer.into_inner()?;
-        let new_obkv = KvReader::<FieldId>::new(&data);
+        let obkv = KvReader::<FieldId>::new(&data);
 
-        // take the non-flattened version if flatten_from_fields_ids_map returns None.
-        let old_flattened = Self::flatten_from_fields_ids_map(&old_obkv, &mut old_fields_ids_map)?;
-        let old_flattened =
-            old_flattened.as_deref().map_or_else(|| old_obkv, KvReader::<FieldId>::new);
-        let new_flattened = Self::flatten_from_fields_ids_map(&new_obkv, &mut new_fields_ids_map)?;
-        let new_flattened =
-            new_flattened.as_deref().map_or_else(|| new_obkv, KvReader::<FieldId>::new);
+        if let Some(original_obkv_buffer) = original_obkv_buffer {
+            original_obkv_buffer.clear();
+            into_del_add_obkv(obkv, DelAddOperation::DeletionAndAddition, original_obkv_buffer)?;
+        }
 
-        original_obkv_buffer.clear();
-        flattened_obkv_buffer.clear();
+        if let Some(flattened_obkv_buffer) = flattened_obkv_buffer {
+            // take the non-flattened version if flatten_from_fields_ids_map returns None.
+            let mut fields_ids_map = settings_diff.new.fields_ids_map.clone();
+            let flattened = Self::flatten_from_fields_ids_map(&obkv, &mut fields_ids_map)?;
+            let flattened = flattened.as_deref().map_or(obkv, KvReader::new);
 
-        del_add_from_two_obkvs(&old_obkv, &new_obkv, original_obkv_buffer)?;
-        del_add_from_two_obkvs(&old_flattened, &new_flattened, flattened_obkv_buffer)?;
+            flattened_obkv_buffer.clear();
+            into_del_add_obkv_conditional_operation(flattened, flattened_obkv_buffer, |id| {
+                operations.get(&id).copied().unwrap_or(DelAddOperation::DeletionAndAddition)
+            })?;
+        }
 
         Ok(())
     }
@@ -871,6 +897,11 @@ impl<'a, 'i> Transform<'a, 'i> {
     /// of the index with the attributes reordered accordingly to the `FieldsIdsMap` given as argument.
     ///
     // TODO this can be done in parallel by using the rayon `ThreadPool`.
+    #[tracing::instrument(
+        level = "trace"
+        skip(self, wtxn, settings_diff),
+        target = "indexing::documents"
+    )]
     pub fn prepare_for_documents_reindexing(
         self,
         wtxn: &mut heed::RwTxn<'i>,
@@ -891,46 +922,63 @@ impl<'a, 'i> Transform<'a, 'i> {
         let documents_count = documents_ids.len() as usize;
 
         // We initialize the sorter with the user indexing settings.
-        let mut original_sorter = create_sorter(
-            grenad::SortAlgorithm::Stable,
-            keep_first,
-            self.indexer_settings.chunk_compression_type,
-            self.indexer_settings.chunk_compression_level,
-            self.indexer_settings.max_nb_chunks,
-            self.indexer_settings.max_memory.map(|mem| mem / 2),
-        );
+        let mut original_sorter = if settings_diff.reindex_vectors() {
+            Some(create_sorter(
+                grenad::SortAlgorithm::Stable,
+                keep_first,
+                self.indexer_settings.chunk_compression_type,
+                self.indexer_settings.chunk_compression_level,
+                self.indexer_settings.max_nb_chunks,
+                self.indexer_settings.max_memory.map(|mem| mem / 2),
+            ))
+        } else {
+            None
+        };
 
         // We initialize the sorter with the user indexing settings.
-        let mut flattened_sorter = create_sorter(
-            grenad::SortAlgorithm::Stable,
-            keep_first,
-            self.indexer_settings.chunk_compression_type,
-            self.indexer_settings.chunk_compression_level,
-            self.indexer_settings.max_nb_chunks,
-            self.indexer_settings.max_memory.map(|mem| mem / 2),
-        );
+        let mut flattened_sorter =
+            if settings_diff.reindex_searchable() || settings_diff.reindex_facets() {
+                Some(create_sorter(
+                    grenad::SortAlgorithm::Stable,
+                    keep_first,
+                    self.indexer_settings.chunk_compression_type,
+                    self.indexer_settings.chunk_compression_level,
+                    self.indexer_settings.max_nb_chunks,
+                    self.indexer_settings.max_memory.map(|mem| mem / 2),
+                ))
+            } else {
+                None
+            };
 
-        let mut original_obkv_buffer = Vec::new();
-        let mut flattened_obkv_buffer = Vec::new();
-        let mut document_sorter_key_buffer = Vec::new();
-        for result in self.index.external_documents_ids().iter(wtxn)? {
-            let (external_id, docid) = result?;
-            let old_obkv = self.index.documents.get(wtxn, &docid)?.ok_or(
-                InternalError::DatabaseMissingEntry { db_name: db_name::DOCUMENTS, key: None },
-            )?;
+        if original_sorter.is_some() || flattened_sorter.is_some() {
+            let modified_faceted_fields = settings_diff.modified_faceted_fields();
+            let mut original_obkv_buffer = Vec::new();
+            let mut flattened_obkv_buffer = Vec::new();
+            let mut document_sorter_key_buffer = Vec::new();
+            for result in self.index.external_documents_ids().iter(wtxn)? {
+                let (external_id, docid) = result?;
+                let old_obkv = self.index.documents.get(wtxn, &docid)?.ok_or(
+                    InternalError::DatabaseMissingEntry { db_name: db_name::DOCUMENTS, key: None },
+                )?;
 
-            Self::rebind_existing_document(
-                old_obkv,
-                &settings_diff,
-                &mut original_obkv_buffer,
-                &mut flattened_obkv_buffer,
-            )?;
+                Self::rebind_existing_document(
+                    old_obkv,
+                    &settings_diff,
+                    &modified_faceted_fields,
+                    Some(&mut original_obkv_buffer).filter(|_| original_sorter.is_some()),
+                    Some(&mut flattened_obkv_buffer).filter(|_| flattened_sorter.is_some()),
+                )?;
 
-            document_sorter_key_buffer.clear();
-            document_sorter_key_buffer.extend_from_slice(&docid.to_be_bytes());
-            document_sorter_key_buffer.extend_from_slice(external_id.as_bytes());
-            original_sorter.insert(&document_sorter_key_buffer, &original_obkv_buffer)?;
-            flattened_sorter.insert(docid.to_be_bytes(), &flattened_obkv_buffer)?;
+                if let Some(original_sorter) = original_sorter.as_mut() {
+                    document_sorter_key_buffer.clear();
+                    document_sorter_key_buffer.extend_from_slice(&docid.to_be_bytes());
+                    document_sorter_key_buffer.extend_from_slice(external_id.as_bytes());
+                    original_sorter.insert(&document_sorter_key_buffer, &original_obkv_buffer)?;
+                }
+                if let Some(flattened_sorter) = flattened_sorter.as_mut() {
+                    flattened_sorter.insert(docid.to_be_bytes(), &flattened_obkv_buffer)?;
+                }
+            }
         }
 
         let grenad_params = GrenadParameters {
@@ -941,17 +989,22 @@ impl<'a, 'i> Transform<'a, 'i> {
         };
 
         // Once we have written all the documents, we merge everything into a Reader.
-        let original_documents = sorter_into_reader(original_sorter, grenad_params)?;
-
-        let flattened_documents = sorter_into_reader(flattened_sorter, grenad_params)?;
+        let flattened_documents = match flattened_sorter {
+            Some(flattened_sorter) => Some(sorter_into_reader(flattened_sorter, grenad_params)?),
+            None => None,
+        };
+        let original_documents = match original_sorter {
+            Some(original_sorter) => Some(sorter_into_reader(original_sorter, grenad_params)?),
+            None => None,
+        };
 
         Ok(TransformOutput {
             primary_key,
             field_distribution,
             settings_diff,
             documents_count,
-            original_documents: original_documents.into_inner().into_inner(),
-            flattened_documents: flattened_documents.into_inner().into_inner(),
+            original_documents: original_documents.map(|od| od.into_inner().into_inner()),
+            flattened_documents: flattened_documents.map(|fd| fd.into_inner().into_inner()),
         })
     }
 }

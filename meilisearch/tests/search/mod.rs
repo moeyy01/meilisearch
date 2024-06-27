@@ -7,6 +7,7 @@ mod facet_search;
 mod formatted;
 mod geo;
 mod hybrid;
+mod matching_strategy;
 mod multi;
 mod pagination;
 mod restrict_searchable;
@@ -680,6 +681,26 @@ async fn search_facet_distribution() {
             },
         )
         .await;
+
+    index.update_settings(json!({"filterableAttributes": ["doggos.name"]})).await;
+    index.wait_task(5).await;
+
+    index
+        .search(
+            json!({
+                "facets": ["doggos.name"]
+            }),
+            |response, code| {
+                assert_eq!(code, 200, "{}", response);
+                let dist = response["facetDistribution"].as_object().unwrap();
+                assert_eq!(dist.len(), 1);
+                assert_eq!(
+                    dist["doggos.name"],
+                    json!({ "bobby": 1, "buddy": 1, "gros bill": 1, "turbo": 1, "fast": 1})
+                );
+            },
+        )
+        .await;
 }
 
 #[actix_rt::test]
@@ -895,9 +916,9 @@ async fn test_score_details() {
                     "id": "166428",
                     "_vectors": {
                       "manual": [
-                        -100,
-                        231,
-                        32
+                        -100.0,
+                        231.0,
+                        32.0
                       ]
                     },
                     "_rankingScoreDetails": {
@@ -921,7 +942,7 @@ async fn test_score_details() {
                         "order": 3,
                         "attributeRankingOrderScore": 1.0,
                         "queryWordDistanceScore": 0.8095238095238095,
-                        "score": 0.9727891156462584
+                        "score": 0.8095238095238095
                       },
                       "exactness": {
                         "order": 4,
@@ -1096,9 +1117,9 @@ async fn experimental_feature_vector_store() {
         "id": "287947",
         "_vectors": {
           "manual": [
-            1,
-            2,
-            3
+            1.0,
+            2.0,
+            3.0
           ]
         },
         "_rankingScore": 1.0
@@ -1108,9 +1129,9 @@ async fn experimental_feature_vector_store() {
         "id": "299537",
         "_vectors": {
           "manual": [
-            1,
-            2,
-            54
+            1.0,
+            2.0,
+            54.0
           ]
         },
         "_rankingScore": 0.9129111766815186
@@ -1120,9 +1141,9 @@ async fn experimental_feature_vector_store() {
         "id": "450465",
         "_vectors": {
           "manual": [
-            -100,
-            340,
-            90
+            -100.0,
+            340.0,
+            90.0
           ]
         },
         "_rankingScore": 0.8106412887573242
@@ -1132,9 +1153,9 @@ async fn experimental_feature_vector_store() {
         "id": "166428",
         "_vectors": {
           "manual": [
-            -100,
-            231,
-            32
+            -100.0,
+            231.0,
+            32.0
           ]
         },
         "_rankingScore": 0.7412010431289673
@@ -1144,9 +1165,9 @@ async fn experimental_feature_vector_store() {
         "id": "522681",
         "_vectors": {
           "manual": [
-            10,
-            -23,
-            32
+            10.0,
+            -23.0,
+            32.0
           ]
         },
         "_rankingScore": 0.6972063183784485
@@ -1405,9 +1426,9 @@ async fn simple_search_with_strange_synonyms() {
                 "id": "166428",
                 "_vectors": {
                   "manual": [
-                    -100,
-                    231,
-                    32
+                    -100.0,
+                    231.0,
+                    32.0
                   ]
                 }
               }
@@ -1426,9 +1447,9 @@ async fn simple_search_with_strange_synonyms() {
                 "id": "166428",
                 "_vectors": {
                   "manual": [
-                    -100,
-                    231,
-                    32
+                    -100.0,
+                    231.0,
+                    32.0
                   ]
                 }
               }
@@ -1447,9 +1468,9 @@ async fn simple_search_with_strange_synonyms() {
                 "id": "166428",
                 "_vectors": {
                   "manual": [
-                    -100,
-                    231,
-                    32
+                    -100.0,
+                    231.0,
+                    32.0
                   ]
                 }
               }

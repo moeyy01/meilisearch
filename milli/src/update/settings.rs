@@ -9,6 +9,7 @@ use itertools::{EitherOrBoth, Itertools};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 
+use super::del_add::DelAddOperation;
 use super::index_documents::{IndexDocumentsConfig, Transform};
 use super::IndexerConfig;
 use crate::criterion::Criterion;
@@ -398,8 +399,6 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
         FP: Fn(UpdateIndexingStep) + Sync,
         FA: Fn() -> bool + Sync,
     {
-        puffin::profile_function!();
-
         // if the settings are set before any document update, we don't need to do anything, and
         // will set the primary key during the first document addition.
         if self.index.number_of_documents(self.wtxn)? == 0 {
@@ -461,50 +460,39 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
         Ok(true)
     }
 
-    /// Updates the index's searchable attributes. This causes the field map to be recomputed to
-    /// reflect the order of the searchable attributes.
+    /// Updates the index's searchable attributes.
     fn update_searchable(&mut self) -> Result<bool> {
         match self.searchable_fields {
             Setting::Set(ref fields) => {
                 // Check to see if the searchable fields changed before doing anything else
                 let old_fields = self.index.searchable_fields(self.wtxn)?;
-                let did_change = match old_fields {
-                    // If old_fields is Some, let's check to see if the fields actually changed
-                    Some(old_fields) => {
-                        let new_fields = fields.iter().map(String::as_str).collect::<Vec<_>>();
-                        new_fields != old_fields
-                    }
-                    // If old_fields is None, the fields have changed (because they are being set)
-                    None => true,
+                let did_change = {
+                    let new_fields = fields.iter().map(String::as_str).collect::<Vec<_>>();
+                    new_fields != old_fields
                 };
                 if !did_change {
                     return Ok(false);
                 }
 
-                // every time the searchable attributes are updated, we need to update the
-                // ids for any settings that uses the facets. (distinct_fields, filterable_fields).
-                let old_fields_ids_map = self.index.fields_ids_map(self.wtxn)?;
-
-                let mut new_fields_ids_map = FieldsIdsMap::new();
+                // Since we're updating the settings we can only add new fields at the end of the field id map
+                let mut fields_ids_map = self.index.fields_ids_map(self.wtxn)?;
                 // fields are deduplicated, only the first occurrence is taken into account
                 let names = fields.iter().unique().map(String::as_str).collect::<Vec<_>>();
 
                 // Add all the searchable attributes to the field map, and then add the
                 // remaining fields from the old field map to the new one
                 for name in names.iter() {
-                    new_fields_ids_map.insert(name).ok_or(UserError::AttributeLimitReached)?;
-                }
-
-                for (_, name) in old_fields_ids_map.iter() {
-                    new_fields_ids_map.insert(name).ok_or(UserError::AttributeLimitReached)?;
+                    // The fields ids map won't change the field id of already present elements thus only the
+                    // new fields will be inserted.
+                    fields_ids_map.insert(name).ok_or(UserError::AttributeLimitReached)?;
                 }
 
                 self.index.put_all_searchable_fields_from_fields_ids_map(
                     self.wtxn,
                     &names,
-                    &new_fields_ids_map,
+                    &fields_ids_map,
                 )?;
-                self.index.put_fields_ids_map(self.wtxn, &new_fields_ids_map)?;
+                self.index.put_fields_ids_map(self.wtxn, &fields_ids_map)?;
                 Ok(true)
             }
             Setting::Reset => Ok(self.index.delete_all_searchable_fields(self.wtxn)?),
@@ -1078,13 +1066,21 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
         // 3. Keep the old vectors but reattempt indexing on a prompt change: only actually changed prompt will need embedding + storage
         let embedding_configs_updated = self.update_embedding_configs()?;
 
-        let new_inner_settings = InnerIndexSettings::from_index(self.index, self.wtxn)?;
-        let inner_settings_diff = InnerIndexSettingsDiff {
-            old: old_inner_settings,
-            new: new_inner_settings,
+        let mut new_inner_settings = InnerIndexSettings::from_index(self.index, self.wtxn)?;
+        new_inner_settings.recompute_facets(self.wtxn, self.index)?;
+
+        let primary_key_id = self
+            .index
+            .primary_key(self.wtxn)?
+            .and_then(|name| new_inner_settings.fields_ids_map.id(name));
+        let settings_update_only = true;
+        let inner_settings_diff = InnerIndexSettingsDiff::new(
+            old_inner_settings,
+            new_inner_settings,
+            primary_key_id,
             embedding_configs_updated,
-            settings_update_only: true,
-        };
+            settings_update_only,
+        );
 
         if inner_settings_diff.any_reindexing_needed() {
             self.reindex(&progress_callback, &should_abort, inner_settings_diff)?;
@@ -1097,31 +1093,108 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
 pub struct InnerIndexSettingsDiff {
     pub(crate) old: InnerIndexSettings,
     pub(crate) new: InnerIndexSettings,
-
+    pub(crate) primary_key_id: Option<FieldId>,
     // TODO: compare directly the embedders.
     pub(crate) embedding_configs_updated: bool,
-
     pub(crate) settings_update_only: bool,
+    /// The set of only the additional searchable fields.
+    /// If any other searchable field has been modified, is set to None.
+    pub(crate) only_additional_fields: Option<HashSet<String>>,
+
+    // Cache the check to see if all the stop_words, allowed_separators, dictionary,
+    // exact_attributes, proximity_precision are different.
+    pub(crate) cache_reindex_searchable_without_user_defined: bool,
+    // Cache the check to see if the user_defined_searchables are different.
+    pub(crate) cache_user_defined_searchables: bool,
+    // Cache the check to see if the exact_attributes are different.
+    pub(crate) cache_exact_attributes: bool,
 }
 
 impl InnerIndexSettingsDiff {
+    #[tracing::instrument(level = "trace", skip_all, target = "indexing::settings")]
+    pub(crate) fn new(
+        old_settings: InnerIndexSettings,
+        new_settings: InnerIndexSettings,
+        primary_key_id: Option<FieldId>,
+        embedding_configs_updated: bool,
+        settings_update_only: bool,
+    ) -> Self {
+        let only_additional_fields = match (
+            &old_settings.user_defined_searchable_fields,
+            &new_settings.user_defined_searchable_fields,
+        ) {
+            (None, None) | (Some(_), None) | (None, Some(_)) => None, // None means *
+            (Some(old), Some(new)) => {
+                let old: HashSet<_> = old.iter().cloned().collect();
+                let new: HashSet<_> = new.iter().cloned().collect();
+                if old.difference(&new).next().is_none() {
+                    // if no field has been removed return only the additional ones
+                    Some(&new - &old).filter(|x| !x.is_empty())
+                } else {
+                    None
+                }
+            }
+        };
+
+        let cache_reindex_searchable_without_user_defined = {
+            old_settings.stop_words.as_ref().map(|set| set.as_fst().as_bytes())
+                != new_settings.stop_words.as_ref().map(|set| set.as_fst().as_bytes())
+                || old_settings.allowed_separators != new_settings.allowed_separators
+                || old_settings.dictionary != new_settings.dictionary
+                || old_settings.proximity_precision != new_settings.proximity_precision
+        };
+
+        let cache_exact_attributes = old_settings.exact_attributes != new_settings.exact_attributes;
+
+        let cache_user_defined_searchables = old_settings.user_defined_searchable_fields
+            != new_settings.user_defined_searchable_fields;
+
+        InnerIndexSettingsDiff {
+            old: old_settings,
+            new: new_settings,
+            primary_key_id,
+            embedding_configs_updated,
+            settings_update_only,
+            only_additional_fields,
+            cache_reindex_searchable_without_user_defined,
+            cache_user_defined_searchables,
+            cache_exact_attributes,
+        }
+    }
+
     pub fn any_reindexing_needed(&self) -> bool {
         self.reindex_searchable() || self.reindex_facets() || self.reindex_vectors()
     }
 
     pub fn reindex_searchable(&self) -> bool {
-        self.old
-            .fields_ids_map
-            .iter()
-            .zip(self.new.fields_ids_map.iter())
-            .any(|(old, new)| old != new)
-            || self.old.stop_words.as_ref().map(|set| set.as_fst().as_bytes())
-                != self.new.stop_words.as_ref().map(|set| set.as_fst().as_bytes())
-            || self.old.allowed_separators != self.new.allowed_separators
-            || self.old.dictionary != self.new.dictionary
-            || self.old.user_defined_searchable_fields != self.new.user_defined_searchable_fields
-            || self.old.exact_attributes != self.new.exact_attributes
-            || self.old.proximity_precision != self.new.proximity_precision
+        self.cache_reindex_searchable_without_user_defined
+            || self.cache_exact_attributes
+            || self.cache_user_defined_searchables
+    }
+
+    pub fn reindex_proximities(&self) -> bool {
+        // if any searchable settings force the reindexing
+        (self.cache_reindex_searchable_without_user_defined || self.cache_user_defined_searchables)
+        // and if any settings needs the proximity database created
+            && (self.old.proximity_precision == ProximityPrecision::ByAttribute
+                || self.new.proximity_precision == ProximityPrecision::ByAttribute)
+    }
+
+    pub fn reindex_searchable_id(&self, id: FieldId) -> Option<DelAddOperation> {
+        if self.cache_reindex_searchable_without_user_defined || self.cache_exact_attributes {
+            Some(DelAddOperation::DeletionAndAddition)
+        } else if let Some(only_additional_fields) = &self.only_additional_fields {
+            let additional_field = self.new.fields_ids_map.name(id).unwrap();
+            if only_additional_fields.contains(additional_field) {
+                Some(DelAddOperation::Addition)
+            } else {
+                None
+            }
+        } else if self.cache_user_defined_searchables {
+            Some(DelAddOperation::DeletionAndAddition)
+        } else {
+            None
+        }
     }
 
     pub fn reindex_facets(&self) -> bool {
@@ -1143,15 +1216,7 @@ impl InnerIndexSettingsDiff {
             return true;
         }
 
-        let faceted_updated =
-            (existing_fields - old_faceted_fields) != (existing_fields - new_faceted_fields);
-
-        self.old
-            .fields_ids_map
-            .iter()
-            .zip(self.new.fields_ids_map.iter())
-            .any(|(old, new)| old != new)
-            || faceted_updated
+        (existing_fields - old_faceted_fields) != (existing_fields - new_faceted_fields)
     }
 
     pub fn reindex_vectors(&self) -> bool {
@@ -1160,6 +1225,15 @@ impl InnerIndexSettingsDiff {
 
     pub fn settings_update_only(&self) -> bool {
         self.settings_update_only
+    }
+
+    pub fn run_geo_indexing(&self) -> bool {
+        self.old.geo_fields_ids != self.new.geo_fields_ids
+            || (!self.settings_update_only && self.new.geo_fields_ids.is_some())
+    }
+
+    pub fn modified_faceted_fields(&self) -> HashSet<String> {
+        &self.old.user_defined_faceted_fields ^ &self.new.user_defined_faceted_fields
     }
 }
 
@@ -1172,11 +1246,12 @@ pub(crate) struct InnerIndexSettings {
     pub user_defined_faceted_fields: HashSet<String>,
     pub user_defined_searchable_fields: Option<Vec<String>>,
     pub faceted_fields_ids: HashSet<FieldId>,
-    pub searchable_fields_ids: Option<Vec<FieldId>>,
+    pub searchable_fields_ids: Vec<FieldId>,
     pub exact_attributes: HashSet<FieldId>,
     pub proximity_precision: ProximityPrecision,
     pub embedding_configs: EmbeddingConfigs,
     pub existing_fields: HashSet<String>,
+    pub geo_fields_ids: Option<(FieldId, FieldId)>,
 }
 
 impl InnerIndexSettings {
@@ -1185,7 +1260,7 @@ impl InnerIndexSettings {
         let stop_words = stop_words.map(|sw| sw.map_data(Vec::from).unwrap());
         let allowed_separators = index.allowed_separators(rtxn)?;
         let dictionary = index.dictionary(rtxn)?;
-        let fields_ids_map = index.fields_ids_map(rtxn)?;
+        let mut fields_ids_map = index.fields_ids_map(rtxn)?;
         let user_defined_searchable_fields = index.user_defined_searchable_fields(rtxn)?;
         let user_defined_searchable_fields =
             user_defined_searchable_fields.map(|sf| sf.into_iter().map(String::from).collect());
@@ -1200,6 +1275,24 @@ impl InnerIndexSettings {
             .into_iter()
             .filter_map(|(field, count)| (count != 0).then_some(field))
             .collect();
+        // index.fields_ids_map($a)? ==>> fields_ids_map
+        let geo_fields_ids = match fields_ids_map.id("_geo") {
+            Some(gfid) => {
+                let is_sortable = index.sortable_fields_ids(rtxn)?.contains(&gfid);
+                let is_filterable = index.filterable_fields_ids(rtxn)?.contains(&gfid);
+                // if `_geo` is faceted then we get the `lat` and `lng`
+                if is_sortable || is_filterable {
+                    let field_ids = fields_ids_map
+                        .insert("_geo.lat")
+                        .zip(fields_ids_map.insert("_geo.lng"))
+                        .ok_or(UserError::AttributeLimitReached)?;
+                    Some(field_ids)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
 
         Ok(Self {
             stop_words,
@@ -1214,6 +1307,7 @@ impl InnerIndexSettings {
             proximity_precision,
             embedding_configs,
             existing_fields,
+            geo_fields_ids,
         })
     }
 
@@ -1233,18 +1327,21 @@ impl InnerIndexSettings {
 
     // find and insert the new field ids
     pub fn recompute_searchables(&mut self, wtxn: &mut heed::RwTxn, index: &Index) -> Result<()> {
+        let searchable_fields = self
+            .user_defined_searchable_fields
+            .as_ref()
+            .map(|searchable| searchable.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
         // in case new fields were introduced we're going to recreate the searchable fields.
-        if let Some(searchable_fields) = self.user_defined_searchable_fields.as_ref() {
-            let searchable_fields =
-                searchable_fields.iter().map(String::as_ref).collect::<Vec<_>>();
+        if let Some(searchable_fields) = searchable_fields {
             index.put_all_searchable_fields_from_fields_ids_map(
                 wtxn,
                 &searchable_fields,
                 &self.fields_ids_map,
             )?;
-            let searchable_fields_ids = index.searchable_fields_ids(wtxn)?;
-            self.searchable_fields_ids = searchable_fields_ids;
         }
+        let searchable_fields_ids = index.searchable_fields_ids(wtxn)?;
+        self.searchable_fields_ids = searchable_fields_ids;
 
         Ok(())
     }
@@ -1517,12 +1614,13 @@ mod tests {
     use big_s::S;
     use heed::types::Bytes;
     use maplit::{btreemap, btreeset, hashset};
+    use meili_snap::snapshot;
 
     use super::*;
     use crate::error::Error;
     use crate::index::tests::TempIndex;
     use crate::update::ClearDocuments;
-    use crate::{Criterion, Filter, SearchResult};
+    use crate::{db_snap, Criterion, Filter, SearchResult};
 
     #[test]
     fn set_and_reset_searchable_fields() {
@@ -1551,19 +1649,31 @@ mod tests {
 
         wtxn.commit().unwrap();
 
+        db_snap!(index, fields_ids_map, @r###"
+        0   id               |
+        1   name             |
+        2   age              |
+        "###);
+        db_snap!(index, searchable_fields, @r###"["name"]"###);
+        db_snap!(index, fieldids_weights_map, @r###"
+        fid weight
+        1   0   |
+        "###);
+
         // Check that the searchable field is correctly set to "name" only.
         let rtxn = index.read_txn().unwrap();
         // When we search for something that is not in
         // the searchable fields it must not return any document.
         let result = index.search(&rtxn).query("23").execute().unwrap();
-        assert!(result.documents_ids.is_empty());
+        assert_eq!(result.documents_ids, Vec::<u32>::new());
 
         // When we search for something that is in the searchable fields
         // we must find the appropriate document.
         let result = index.search(&rtxn).query(r#""kevin""#).execute().unwrap();
         let documents = index.documents(&rtxn, result.documents_ids).unwrap();
+        let fid_map = index.fields_ids_map(&rtxn).unwrap();
         assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].1.get(0), Some(&br#""kevin""#[..]));
+        assert_eq!(documents[0].1.get(fid_map.id("name").unwrap()), Some(&br#""kevin""#[..]));
         drop(rtxn);
 
         // We change the searchable fields to be the "name" field only.
@@ -1573,14 +1683,31 @@ mod tests {
             })
             .unwrap();
 
+        db_snap!(index, fields_ids_map, @r###"
+        0   id               |
+        1   name             |
+        2   age              |
+        "###);
+        db_snap!(index, searchable_fields, @r###"["id", "name", "age"]"###);
+        db_snap!(index, fieldids_weights_map, @r###"
+        fid weight
+        0   0   |
+        1   0   |
+        2   0   |
+        "###);
+
         // Check that the searchable field have been reset and documents are found now.
         let rtxn = index.read_txn().unwrap();
+        let fid_map = index.fields_ids_map(&rtxn).unwrap();
+        let user_defined_searchable_fields = index.user_defined_searchable_fields(&rtxn).unwrap();
+        snapshot!(format!("{user_defined_searchable_fields:?}"), @"None");
+        // the searchable fields should contain all the fields
         let searchable_fields = index.searchable_fields(&rtxn).unwrap();
-        assert_eq!(searchable_fields, None);
+        snapshot!(format!("{searchable_fields:?}"), @r###"["id", "name", "age"]"###);
         let result = index.search(&rtxn).query("23").execute().unwrap();
         assert_eq!(result.documents_ids.len(), 1);
         let documents = index.documents(&rtxn, result.documents_ids).unwrap();
-        assert_eq!(documents[0].1.get(0), Some(&br#""kevin""#[..]));
+        assert_eq!(documents[0].1.get(fid_map.id("name").unwrap()), Some(&br#""kevin""#[..]));
     }
 
     #[test]

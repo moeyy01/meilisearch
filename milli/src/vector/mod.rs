@@ -13,6 +13,7 @@ pub mod error;
 pub mod hf;
 pub mod manual;
 pub mod openai;
+pub mod parsed_vectors;
 pub mod settings;
 
 pub mod ollama;
@@ -145,6 +146,10 @@ impl EmbeddingConfigs {
     /// Get the default embedder configuration, if any.
     pub fn get_default(&self) -> Option<(Arc<Embedder>, Arc<Prompt>)> {
         self.get(self.get_default_embedder_name())
+    }
+
+    pub fn inner_as_ref(&self) -> &HashMap<String, (Arc<Embedder>, Arc<Prompt>)> {
+        &self.0
     }
 
     /// Get the name of the default embedder configuration.
@@ -436,4 +441,10 @@ impl DistributionShift {
 /// Whether CUDA is supported in this version of Meilisearch.
 pub const fn is_cuda_enabled() -> bool {
     cfg!(feature = "cuda")
+}
+
+pub fn arroy_db_range_for_embedder(embedder_id: u8) -> impl Iterator<Item = u16> {
+    let embedder_id = (embedder_id as u16) << 8;
+
+    (0..=u8::MAX).map(move |k| embedder_id | (k as u16))
 }

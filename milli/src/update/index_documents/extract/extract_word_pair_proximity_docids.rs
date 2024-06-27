@@ -26,12 +26,8 @@ pub fn extract_word_pair_proximity_docids<R: io::Read + io::Seek>(
     indexer: GrenadParameters,
     settings_diff: &InnerIndexSettingsDiff,
 ) -> Result<grenad::Reader<BufReader<File>>> {
-    puffin::profile_function!();
-    let any_deletion = settings_diff.old.proximity_precision == ProximityPrecision::ByWord;
-    let any_addition = settings_diff.new.proximity_precision == ProximityPrecision::ByWord;
-
     // early return if the data shouldn't be deleted nor created.
-    if !any_deletion && !any_addition {
+    if settings_diff.settings_update_only && !settings_diff.reindex_proximities() {
         let writer = create_writer(
             indexer.chunk_compression_type,
             indexer.chunk_compression_level,
@@ -40,8 +36,10 @@ pub fn extract_word_pair_proximity_docids<R: io::Read + io::Seek>(
         return writer_into_reader(writer);
     }
 
-    let max_memory = indexer.max_memory_by_thread();
+    let any_deletion = settings_diff.old.proximity_precision == ProximityPrecision::ByWord;
+    let any_addition = settings_diff.new.proximity_precision == ProximityPrecision::ByWord;
 
+    let max_memory = indexer.max_memory_by_thread();
     let mut word_pair_proximity_docids_sorters: Vec<_> = (1..MAX_DISTANCE)
         .map(|_| {
             create_sorter(
@@ -71,8 +69,6 @@ pub fn extract_word_pair_proximity_docids<R: io::Read + io::Seek>(
 
         // if we change document, we fill the sorter
         if current_document_id.map_or(false, |id| id != document_id) {
-            puffin::profile_scope!("Document into sorter");
-
             // FIXME: span inside of a hot loop might degrade performance and create big reports
             let span = tracing::trace_span!(target: "indexing::details", "document_into_sorter");
             let _entered = span.enter();
@@ -163,7 +159,6 @@ pub fn extract_word_pair_proximity_docids<R: io::Read + io::Seek>(
     }
 
     if let Some(document_id) = current_document_id {
-        puffin::profile_scope!("Final document into sorter");
         // FIXME: span inside of a hot loop might degrade performance and create big reports
         let span = tracing::trace_span!(target: "indexing::details", "final_document_into_sorter");
         let _entered = span.enter();
@@ -176,7 +171,6 @@ pub fn extract_word_pair_proximity_docids<R: io::Read + io::Seek>(
         )?;
     }
     {
-        puffin::profile_scope!("sorter_into_reader");
         // FIXME: span inside of a hot loop might degrade performance and create big reports
         let span = tracing::trace_span!(target: "indexing::details", "sorter_into_reader");
         let _entered = span.enter();
