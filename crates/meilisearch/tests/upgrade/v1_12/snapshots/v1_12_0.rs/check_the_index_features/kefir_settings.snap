@@ -1,0 +1,88 @@
+---
+source: crates/meilisearch/tests/upgrade/v1_12/v1_12_0.rs
+---
+{
+  "displayedAttributes": [
+    "*"
+  ],
+  "searchableAttributes": [
+    "*"
+  ],
+  "filterableAttributes": [
+    "age",
+    "surname"
+  ],
+  "sortableAttributes": [
+    "age"
+  ],
+  "rankingRules": [
+    "words",
+    "typo",
+    "proximity",
+    "attributeRank",
+    "sort",
+    "wordPosition",
+    "exactness"
+  ],
+  "stopWords": [
+    "le",
+    "un"
+  ],
+  "nonSeparatorTokens": [],
+  "separatorTokens": [],
+  "dictionary": [],
+  "synonyms": {
+    "boubou": [
+      "kefir"
+    ]
+  },
+  "distinctAttribute": null,
+  "proximityPrecision": "byWord",
+  "typoTolerance": {
+    "enabled": true,
+    "minWordSizeForTypos": {
+      "oneTypo": 4,
+      "twoTypos": 9
+    },
+    "disableOnWords": [
+      "kefir"
+    ],
+    "disableOnAttributes": [
+      "surname"
+    ],
+    "disableOnNumbers": false
+  },
+  "faceting": {
+    "maxValuesPerFacet": 99,
+    "sortFacetValuesBy": {
+      "*": "alpha",
+      "age": "count"
+    }
+  },
+  "pagination": {
+    "maxTotalHits": 15
+  },
+  "embedders": {
+    "doggo_embedder": {
+      "source": "huggingFace",
+      "model": "sentence-transformers/all-MiniLM-L6-v2",
+      "revision": "e4ce9877abf3edfe10b0d82785e83bdcb973e22e",
+      "pooling": "forceMean",
+      "documentTemplate": "{{doc.description}}",
+      "documentTemplateMaxBytes": 400
+    }
+  },
+  "searchCutoffMs": 8000,
+  "localizedAttributes": [
+    {
+      "attributePatterns": [
+        "description"
+      ],
+      "locales": [
+        "fra"
+      ]
+    }
+  ],
+  "facetSearch": true,
+  "prefixSearch": "indexingTime"
+}

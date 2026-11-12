@@ -1,0 +1,21 @@
+---
+source: crates/meilisearch/tests/search/distinct.rs
+---
+{
+  "uid": "[uid]",
+  "batchUid": "[batch_uid]",
+  "indexUid": "[uuid]",
+  "status": "succeeded",
+  "type": "settingsUpdate",
+  "canceledBy": null,
+  "details": {
+    "filterableAttributes": [
+      "color.main"
+    ]
+  },
+  "error": null,
+  "duration": "[duration]",
+  "enqueuedAt": "[date]",
+  "startedAt": "[date]",
+  "finishedAt": "[date]"
+}

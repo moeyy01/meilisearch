@@ -3,14 +3,10 @@ name: Test suite
 on:
   workflow_dispatch:
   schedule:
-    # Everyday at 5:00am
-    - cron: '0 5 * * *'
+    # Every day at 5:00am
+    - cron: "0 5 * * *"
   pull_request:
-  push:
-    # trying and staging branches are for Bors config
-    branches:
-      - trying
-      - staging
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,104 +15,160 @@ env:
 
 jobs:
   test-linux:
-    name: Tests on ubuntu-18.04
-    runs-on: ubuntu-latest
-    container:
-      # Use ubuntu-18.04 to compile with glibc 2.27, which are the production expectations
-      image: ubuntu:18.04
+    name: Tests on ${{ matrix.runner }} ${{ matrix.features }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+        features: ["", "--features enterprise"]
     steps:
-      - uses: actions/checkout@v3
-      - name: Install needed dependencies
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: check free space before
+        run: df -h
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
         run: |
-          apt-get update && apt-get install -y curl
-          apt-get install build-essential -y
-      - name: Setup test with Rust stable
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
+      - name: check free space after
+        run: df -h
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2.7.1
-      - name: Run cargo check without any default features
-        uses: actions-rs/cargo@v1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          command: build
-          args: --locked --release --no-default-features --all
+          key: ${{ matrix.features }}
+      - name: Run cargo build without any default features
+        run: cargo build --locked --no-default-features --all
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --locked --release --all
+        run: cargo test --locked --all ${{ matrix.features }}
 
-  test-others:
+  test-windows:
     name: Tests on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-12, windows-2022]
+        os: [windows-2022]
+        features: ["", "--features enterprise"]
+    if: github.event_name != 'merge_group'
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2.7.1
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-      - name: Run cargo check without any default features
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --locked --release --no-default-features --all
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run cargo build without any default features
+        run: cargo build --locked --no-default-features --all
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --locked --release --all
+        run: cargo test --locked --all ${{ matrix.features }}
+
+  test-macos:
+    name: Tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14]
+        features: ["", "--features enterprise"]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run cargo build without any default features
+        run: cargo build --locked --no-default-features --all
+      - name: Run cargo test
+        run: cargo test --locked --all ${{ matrix.features }}
 
   test-all-features:
     name: Tests almost all features
-    runs-on: ubuntu-latest
-    container:
-      # Use ubuntu-18.04 to compile with glibc 2.27, which are the production expectations
-      image: ubuntu:18.04
+    runs-on: ubuntu-22.04
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v3
-      - name: Install needed dependencies
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
         run: |
-          apt-get update
-          apt-get install --assume-yes build-essential curl
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
       - name: Run cargo build with almost all features
         run: |
-          cargo build --workspace --locked --release --features "$(cargo xtask list-features --exclude-feature cuda)"
+          cargo build --workspace --locked --features "$(cargo xtask list-features --exclude-feature cuda,test-ollama)"
       - name: Run cargo test with almost all features
         run: |
-          cargo test --workspace --locked --release --features "$(cargo xtask list-features --exclude-feature cuda)"
+          cargo test --workspace --locked --features "$(cargo xtask list-features --exclude-feature cuda,test-ollama)"
+
+  ollama-ubuntu:
+    name: Test with Ollama
+    runs-on: ubuntu-22.04
+    env:
+      MEILI_TEST_OLLAMA_SERVER: "http://localhost:11434"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
+        run: |
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sudo -E sh
+      - name: Start serving
+        run: |
+          # Run it in the background, there is no way to daemonise at the moment
+          ollama serve &
+
+          # A short pause is required before the HTTP port is opened
+          sleep 5
+
+          # This endpoint blocks until ready
+          time curl -i http://localhost:11434
+
+      - name: Pull nomic-embed-text & all-minilm
+        run: |
+          ollama pull nomic-embed-text
+          ollama pull all-minilm
+
+      - name: Run cargo test
+        run: cargo test --locked -p meilisearch --features test-ollama ollama
+
+  test-legacy-indexer:
+    name: Test legacy settings indexer
+    runs-on: ubuntu-22.04
+    env:
+      MEILI_EXPERIMENTAL_NO_EDITION_2024_FOR_SETTINGS: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: check free space before
+        run: df -h
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
+        run: |
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
+      - name: check free space after
+        run: df -h
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run cargo test
+        run: cargo test --locked --all
 
   test-disabled-tokenization:
     name: Test disabled tokenization
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:18.04
+    runs-on: ubuntu-22.04
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v3
-      - name: Install needed dependencies
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
         run: |
-          apt-get update
-          apt-get install --assume-yes build-essential curl
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
       - name: Run cargo tree without default features and check lindera is not present
         run: |
-          if cargo tree -f '{p} {f}' -e normal --no-default-features | grep -vqz lindera; then
+          if cargo tree -f '{p} {f}' -e normal --no-default-features | grep -qz lindera; then
             echo "lindera has been found in the sources and it shouldn't"
             exit 1
           fi
@@ -124,67 +176,72 @@ jobs:
         run: |
           cargo tree -f '{p} {f}' -e normal | grep lindera -qz
 
-  # We run tests in debug also, to make sure that the debug_assertions are hit
-  test-debug:
-    name: Run tests in debug
-    runs-on: ubuntu-latest
-    container:
-      # Use ubuntu-18.04 to compile with glibc 2.27, which are the production expectations
-      image: ubuntu:18.04
+  build:
+    name: Build in release
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
-      - name: Install needed dependencies
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
         run: |
-          apt-get update && apt-get install -y curl
-          apt-get install build-essential -y
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2.7.1
-      - name: Run tests in debug
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --locked --all
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
   clippy:
     name: Run Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        features: ["", "--features enterprise"]
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: 1.75.0
-          override: true
-          components: clippy
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
+        run: |
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2.7.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --all-targets -- --deny warnings
+        run: cargo clippy --all-targets ${{ matrix.features }} -- --deny warnings -D clippy::todo
 
   fmt:
     name: Run Rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: nightly
-          override: true
-          components: rustfmt
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2.7.1
-      - name: Run cargo fmt
-        # Since we never ran the `build.rs` script in the benchmark directory we are missing one auto-generated import file.
-        # Since we want to trigger (and fail) this action as fast as possible, instead of building the benchmark crate
-        # we are going to create an empty file where rustfmt expects it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
         run: |
-          echo -ne "\n" > benchmarks/benches/datasets_paths.rs
-          cargo fmt --all -- --check
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+  declarative-tests:
+    name: Run declarative tests
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clean space as per https://github.com/actions/virtual-environments/issues/709
+        run: |
+          sudo rm -rf "/opt/ghc" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run declarative tests
+        run: |
+          cargo xtask test workloads/tests/*.json

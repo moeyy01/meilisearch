@@ -1,0 +1,38 @@
+use milli::OrderBy;
+
+#[routes::request(setting, no_error)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub enum FacetValuesSort {
+    /// Facet values are sorted in alphabetical order, ascending from A to Z.
+    #[default]
+    Alpha,
+    /// Facet values are sorted by decreasing count.
+    /// The count is the number of records containing this facet value in the results of the query.
+    Count,
+    /// Facets values are sorted by decreasing count.
+    ///
+    /// The engine will use sampling to determine the facet values to include in the count which is
+    /// fast but may skip important values. The count is the number of records containing this facet
+    /// value in the results of the query.
+    SampledCount,
+}
+
+impl From<FacetValuesSort> for OrderBy {
+    fn from(val: FacetValuesSort) -> Self {
+        match val {
+            FacetValuesSort::Alpha => OrderBy::Lexicographic,
+            FacetValuesSort::Count => OrderBy::Count,
+            FacetValuesSort::SampledCount => OrderBy::SampledCount,
+        }
+    }
+}
+
+impl From<OrderBy> for FacetValuesSort {
+    fn from(val: OrderBy) -> Self {
+        match val {
+            OrderBy::Lexicographic => FacetValuesSort::Alpha,
+            OrderBy::Count => FacetValuesSort::Count,
+            OrderBy::SampledCount => FacetValuesSort::SampledCount,
+        }
+    }
+}

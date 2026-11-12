@@ -3,7 +3,7 @@
 Currently this repository hosts two kinds of benchmarks:
 
 1. The older "milli benchmarks", that use [criterion](https://github.com/bheisler/criterion.rs) and live in the "benchmarks" directory.
-2. The newer "bench" that are workload-based and so split between the [`workloads`](./workloads/) directory and the [`xtask::bench`](./xtask/src/bench/) module.
+2. The newer "bench" that are workload-based and so split between the [`workloads`](./workloads/) directory and the [`xtask::bench`](./crates/xtask/src/bench/) module.
 
 This document describes the newer "bench" benchmarks. For more details on the "milli benchmarks", see [benchmarks/README.md](./benchmarks/README.md).
 
@@ -47,6 +47,27 @@ cargo xtask bench --no-dashboard -- workloads/my_workload_1.json workloads/my_wo
 ```
 
 For processing the results, look at [Looking at benchmark results/Without dashboard](#without-dashboard).
+
+#### Sending a workload by hand
+
+Sometimes you want to visualize the metrics of a worlkoad that comes from a custom report.
+It is not quite easy to trick the benchboard in thinking that your report is legitimate but here are the commands you can run to upload your firefox report on a running benchboard.
+
+```bash
+# Name this hostname whatever you want
+echo '{ "hostname": "the-best-place" }' | xh PUT 'http://127.0.0.1:9001/api/v1/machine'
+
+# You'll receive an UUID from this command that we will call $invocation_uuid
+echo '{ "commit": { "sha1": "1234567", "commit_date": "2024-09-05 12:00:12.0 +00:00:00", "message": "A cool message" }, "machine_hostname": "the-best-place", "max_workloads": 1 }' | xh PUT 'http://127.0.0.1:9001/api/v1/invocation'
+
+# Just use UUID from the previous command
+# and you'll receive another UUID that we will call $workload_uuid
+echo '{ "invocation_uuid": "$invocation_uuid", "name": "toto", "max_runs": 1 }' | xh PUT 'http://127.0.0.1:9001/api/v1/workload'
+
+# And now use your $workload_uuid and the content of your firefox report
+# but don't forget to convert your firefox report from JSONLines into an object
+echo '{ "workload_uuid": "$workload_uuid", "data": $REPORT_JSON_DATA }' | xh PUT 'http://127.0.0.1:9001/api/v1/run'
+```
 
 ### In CI
 
@@ -103,18 +124,25 @@ They are JSON files with the following structure (comments are not actually supp
 {
   // Name of the workload. Must be unique to the workload, as it will be used to group results on the dashboard.
   "name": "hackernews.ndjson_1M,no-threads",
+  "type": "bench",
   // Number of consecutive runs of the commands that should be performed.
   // Each run uses a fresh instance of Meilisearch and a fresh database.
   // Each run produces its own report file.
   "run_count": 3,
   // List of arguments to add to the Meilisearch command line.
   "extra_cli_args": ["--max-indexing-threads=1"],
+  // An expression that can be parsed as a comma-separated list of targets and levels
+  // as described in [tracing_subscriber's documentation](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/targets/struct.Targets.html#examples).
+  // The expression is used to filter the spans that are measured for profiling purposes.
+  // Optional, defaults to "indexing::=trace" (for indexing workloads), common other values is
+  // "search::=trace"
+  "target": "indexing::=trace",
   // List of named assets that can be used in the commands.
   "assets": {
     // name of the asset.
     // Must be unique at the workload level.
-    // For better results, the same asset (same sha256) should have the same name accross workloads.
-    // Having multiple assets with the same name and distinct hashes is supported accross workloads,
+    // For better results, the same asset (same sha256) should have the same name across workloads.
+    // Having multiple assets with the same name and distinct hashes is supported across workloads,
     // but will lead to superfluous downloads.
     //
     // Assets are stored in the `bench/assets/` directory by default.

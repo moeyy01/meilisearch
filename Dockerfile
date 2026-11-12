@@ -1,32 +1,30 @@
 # Compile
-FROM    rust:1.75.0-alpine3.18 AS compiler
+FROM    rust:1.99-alpine3.22 AS compiler
 
-RUN     apk add -q --update-cache --no-cache build-base openssl-dev
+RUN     apk add -q --no-cache -u ca-certificates build-base openssl-dev
 
 WORKDIR /
 
 ARG     COMMIT_SHA
 ARG     COMMIT_DATE
 ARG     GIT_TAG
+ARG     EXTRA_ARGS
 ENV     VERGEN_GIT_SHA=${COMMIT_SHA} VERGEN_GIT_COMMIT_TIMESTAMP=${COMMIT_DATE} VERGEN_GIT_DESCRIBE=${GIT_TAG}
 ENV     RUSTFLAGS="-C target-feature=-crt-static"
 
 COPY    . .
 RUN     set -eux; \
         apkArch="$(apk --print-arch)"; \
-        if [ "$apkArch" = "aarch64" ]; then \
-            export JEMALLOC_SYS_WITH_LG_PAGE=16; \
-        fi && \
-        cargo build --release -p meilisearch -p meilitool
+        cargo build --release -p meilisearch -p meilitool ${EXTRA_ARGS}
 
 # Run
-FROM    alpine:3.16
+FROM    alpine:3.22
+LABEL   org.opencontainers.image.source="https://github.com/meilisearch/meilisearch"
 
 ENV     MEILI_HTTP_ADDR 0.0.0.0:7700
 ENV     MEILI_SERVER_PROVIDER docker
 
-RUN     apk update --quiet \
-        && apk add -q --no-cache libgcc tini curl
+RUN     apk add -q --no-cache -u ca-certificates-bundle libgcc tini curl
 
 # add meilisearch and meilitool to the `/bin` so you can run it from anywhere
 # and it's easy to find.

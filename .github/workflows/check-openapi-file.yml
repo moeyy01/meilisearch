@@ -1,0 +1,61 @@
+name: Check OpenAPI file
+
+on:
+  workflow_dispatch:
+  pull_request:
+  schedule:
+    # Run daily at 5 AM UTC
+    - cron: '0 5 * * *'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check-openapi:
+    name: Check OpenAPI specification
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '20'
+
+      - name: Install OpenAPI tools
+        run: npm install -g @apidevtools/swagger-cli @stoplight/spectral-cli
+
+      - name: Generate OpenAPI file
+        run: cargo run --release -p openapi-generator -- --pretty --output-dir /tmp/
+
+      - name: Check all routes have summaries
+        run: cargo run --release -p openapi-generator -- --check-summaries
+
+      - name: Check all routes have descriptions
+        run: cargo run --release -p openapi-generator -- --check-descriptions
+
+      - name: Check for duplicate or malformed paths
+        run: cargo run --release -p openapi-generator -- --check-paths
+
+      - name: Check OpenAPI documentation (routes, params, response examples, schema properties)
+        run: cargo run --release -p openapi-generator -- --check-docs
+
+      - name: Check query and body params have explicit required = true/false
+        run: cargo run --release -p openapi-generator -- --check-params
+
+      # Validates that the OpenAPI file is syntactically correct and conforms to the OpenAPI specification
+      - name: Validate OpenAPI schema
+        run: swagger-cli validate /tmp/meilisearch-openapi.json
+
+      # Lints the OpenAPI file for best practices (descriptions, examples, naming conventions, etc.)
+      # Ruleset is defined in crates/openapi-generator/.spectral.yaml
+      - name: Lint OpenAPI specification
+        run: spectral lint /tmp/meilisearch-openapi.json --verbose --ruleset crates/openapi-generator/.spectral.yaml

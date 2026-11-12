@@ -1,28 +1,33 @@
 [workspace]
 resolver = "2"
 members = [
-    "meilisearch",
-    "meilitool",
-    "meilisearch-types",
-    "meilisearch-auth",
-    "meili-snap",
-    "index-scheduler",
-    "dump",
-    "file-store",
-    "permissive-json-pointer",
-    "milli",
-    "filter-parser",
-    "flatten-serde-json",
-    "json-depth-checker",
-    "benchmarks",
-    "fuzzers",
-    "tracing-trace",
-    "xtask",
-    "build-info",
+    "crates/meilisearch",
+    "crates/meilitool",
+    "crates/meilisearch-types",
+    "crates/meilisearch-auth",
+    "crates/meili-snap",
+    "crates/index-scheduler",
+    "crates/dump",
+    "crates/file-store",
+    "crates/permissive-json-pointer",
+    "crates/milli",
+    "crates/filter-parser",
+    "crates/flatten-serde-json",
+    "crates/json-depth-checker",
+    "crates/fuzzers",
+    "crates/tracing-trace",
+    "crates/xtask",
+    "crates/build-info",
+    "crates/openapi-generator",
+    "crates/http-client",
+    "crates/routes-macros",
+    "crates/routes",
+    "external-crates/async-openai",
+    "external-crates/async-openai-macros",
 ]
 
 [workspace.package]
-version = "1.8.0"
+version = "1.57.0"
 authors = [
     "Quentin de Quelen <quentin@dequelen.me>",
     "Clément Renault <clement@meilisearch.com>",
@@ -33,8 +38,21 @@ readme = "README.md"
 edition = "2021"
 license = "MIT"
 
+[workspace.dependencies]
+tikv-jemallocator = {version = "0.7.0", features = ["override_allocator_on_supported_platforms"]}
+
 [profile.release]
 codegen-units = 1
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+
+# We now compile heed without the NDEBUG define for better performance.
+# However, we still enable debug assertions for a better detection of
+# disk corruption on the cloud or in OSS.
+[profile.release.package.heed]
+debug-assertions = true
 
 [profile.dev.package.flate2]
 opt-level = 3
@@ -43,24 +61,5 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.roaring]
 opt-level = 3
-
-[profile.dev.package.lindera-ipadic-builder]
-opt-level = 3
-[profile.dev.package.encoding]
-opt-level = 3
-[profile.dev.package.yada]
-opt-level = 3
-
-[profile.release.package.lindera-ipadic-builder]
-opt-level = 3
-[profile.release.package.encoding]
-opt-level = 3
-[profile.release.package.yada]
-opt-level = 3
-
-[profile.bench.package.lindera-ipadic-builder]
-opt-level = 3
-[profile.bench.package.encoding]
-opt-level = 3
-[profile.bench.package.yada]
+[profile.dev.package.gemm-f16]
 opt-level = 3

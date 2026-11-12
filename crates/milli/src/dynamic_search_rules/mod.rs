@@ -1,0 +1,543 @@
+#![warn(missing_docs)]
+
+//! Types and functions related to the dynamic search rules.
+
+use std::cmp::Ordering;
+
+use heed::{BytesDecode, RoTxn, WithoutTls};
+use roaring::RoaringBitmap;
+use time::OffsetDateTime;
+
+use crate::dynamic_search_rules::preview::RulePreviewWithId;
+use crate::heed_codec::facet::{FacetGroupKey, FacetGroupValue, OrderedF64Codec};
+use crate::progress::Progress;
+use crate::search::facet::ascending_facet_sort;
+use crate::search::new::LocatedQueryTerm;
+use crate::search::{Pin, ScaleDocs};
+use crate::update::new::document::DocumentFromDb;
+use crate::{
+    AscDesc, DocumentId, FieldId, FieldsIdsMap, Index, IndexFilter, PinDoc, Result, SearchContext,
+    SearchResult, UserError,
+};
+
+mod action;
+mod condition;
+mod fuel;
+mod preview;
+/// Contains type declarations for older versions of dsr objects
+pub mod upgrade;
+
+/// Fields used in DSR documents
+pub mod fields;
+
+pub use action::{PinAction, RuleActions, ScaleAction};
+pub use fuel::DsrFuel;
+pub use preview::{
+    ConditionOutcomes, FilterCondition as PreviewFilterCondition, FilterConditionOutcome,
+    PreviewConditions, QueryCondition as PreviewQueryCondition, QueryEmptyConditionOutcome,
+    QueryWordsConditionOutcome, RulePreview, TimeCondition as PreviewTimeCondition,
+    TimeConditionOutcome,
+};
+pub use upgrade::{create_metadata, upgrade_dsrs, METADATA_UID};
+
+/// Internal identifier of a rule.
+///
+/// - Roaring bitmaps reference rules by this id.
+/// - Not to be confused with a rule uid, which is a user-provided string uniquely naming the rule.
+/// - Internal identifiers are not expected to remain stable across indexing and
+///
+/// See also [`DocumentId`].
+pub type RuleId = u32;
+
+/// Wrapper around the DSR index.
+///
+/// Allows to:
+/// - List rules.
+/// - Find applicable actions for a given query.
+///
+/// If you don't want to relinquish ownership of a transaction and/or an index, use [`DynamicSearchRulesView`].
+///
+/// # Metadata
+///
+/// The DSR index includes a special "metadata" document. The implementation ensures that it is not returned as a normal rule.
+/// This document is responsible to hold the internal schema version, and is updated on version upgrades.
+/// It should also be created when creating the index (see [`create_metadata`]).
+pub struct DynamicSearchRules {
+    index: Index,
+    rtxn: RoTxn<'static, WithoutTls>,
+    db_fields_ids_map: FieldsIdsMap,
+}
+
+/// Wrapper around the DSR index.
+///
+/// Allows to:
+/// - List rules.
+/// - Find applicable actions for a given query.
+///
+/// If you want to store this view in a struct without a lifetime, consider [`DynamicSearchRules`].
+///
+/// # Metadata
+///
+/// The DSR index includes a special "metadata" document. The implementation ensures that it is not returned as a normal rule.
+/// This document is responsible to hold the internal schema version, and is updated on version upgrades.
+/// It should also be created when creating the index (see [`create_metadata`]).
+#[derive(Clone, Copy)]
+pub struct DynamicSearchRulesView<'a> {
+    index: &'a Index,
+    rtxn: &'a RoTxn<'a, WithoutTls>,
+    db_fields_ids_map: &'a FieldsIdsMap,
+}
+
+impl<'a> DynamicSearchRulesView<'a> {
+    /// Creates a view around an index and rtxn.
+    pub fn new(
+        index: &'a Index,
+        rtxn: &'a RoTxn<'a, WithoutTls>,
+        db_fields_ids_map: &'a FieldsIdsMap,
+    ) -> Self {
+        Self { index, rtxn, db_fields_ids_map }
+    }
+
+    fn metadata_internal_id(self) -> Result<Option<DocumentId>> {
+        Ok(self.index.external_documents_ids().get(self.rtxn, METADATA_UID)?)
+    }
+
+    /// Get the raw representation of a rule from its UID.
+    pub fn get(self, rule_uid: &str) -> Result<Option<DocumentFromDb<'a, FieldsIdsMap>>> {
+        let Some(docid) = self.get_id(rule_uid)? else { return Ok(None) };
+
+        self.get_from_internal_id(docid)
+    }
+
+    /// `true` if the rule with the specified UID currently exists in the DSR index.
+    pub fn exists(&self, rule_uid: &str) -> Result<bool> {
+        // get_id uses ExternalDocumentIds::get, which deserializes a single BEU32, a rather cheap operation
+        Ok(self.get_id(rule_uid)?.is_some())
+    }
+
+    fn get_id(self, rule_uid: &str) -> Result<Option<RuleId>> {
+        if rule_uid == METADATA_UID {
+            return Ok(None);
+        }
+
+        Ok(self.index.external_documents_ids().get(self.rtxn, rule_uid)?)
+    }
+
+    /// Get the raw representation of a rule or the index metadata, from its internal ID.
+    pub fn get_from_internal_id(
+        self,
+        rule_or_metadata_id: DocumentId,
+    ) -> Result<Option<DocumentFromDb<'a, FieldsIdsMap>>> {
+        let Some(doc) = DocumentFromDb::new(
+            rule_or_metadata_id,
+            self.rtxn,
+            self.index,
+            self.db_fields_ids_map,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(doc))
+    }
+
+    /// Resolve the applicable actions for the given query.
+    pub fn resolve_actions(
+        this: Option<Self>,
+        query_terms: &[LocatedQueryTerm],
+        filter: Option<&IndexFilter>,
+        universe: &mut RoaringBitmap,
+        search_context: &SearchContext,
+        fuel: DsrFuel,
+        preview: Option<&RulePreview>,
+    ) -> Result<(Vec<PinDoc>, Vec<ScaleDocs>, Option<ConditionOutcomes>)> {
+        let preview = preview
+            .and_then(|preview| match preview.find_id(this) {
+                Ok(Some(preview_id)) => Some(Ok(RulePreviewWithId { preview, preview_id })),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .transpose()?;
+
+        let (sorted_unique_query_terms, filter_constraints) =
+            Self::prepare_query(query_terms, filter, search_context, fuel)?;
+
+        let active_rules = if let Some(this) = this {
+            this.active_rules_for_query(
+                &sorted_unique_query_terms,
+                &filter_constraints,
+                search_context,
+                fuel,
+            )?
+        } else {
+            Default::default()
+        };
+
+        let preview_outcome = preview
+            .map(|preview| {
+                // precondition: see postcondition of `prepare_query`
+                let outcome = preview.preview.evaluate_conditions(
+                    &sorted_unique_query_terms,
+                    &filter_constraints,
+                    search_context.before_search,
+                )?;
+                Ok::<_, crate::Error>((preview, outcome))
+            })
+            .transpose()?;
+
+        let active_preview = preview_outcome
+            .as_ref()
+            .and_then(|(preview, outcome)| outcome.is_enabled().then_some(preview));
+
+        // this used to be a flattened iterator of pin iterators.
+        // however we can no longer flatten because we have an iterator of `(pin_iterator, scale_iterator)`
+        // so we are using an explicit loop
+        let mut pins = Vec::new();
+        let mut scales = Vec::new();
+
+        for res in Self::find_actions(
+            this,
+            Self::rule_ids_sorted_by_precedence(this, active_rules, active_preview)?,
+            search_context,
+            fuel,
+            active_preview,
+        ) {
+            if pins.len() >= fuel.max_pin_actions() && scales.len() >= fuel.max_scale_actions() {
+                break;
+            }
+
+            let (pin, scale) = res?;
+            for pin in pin {
+                if pins.len() >= fuel.max_pin_actions() {
+                    break;
+                }
+                let pin = pin?;
+                // this removal serves 2 simultaneous purposes:
+                // 1. make sure that the pinned document cannot appear in the organic results
+                // 2. make sure that the pinned document is initially part of the candidates post-filter: this is a security property
+                // of pinning that you cannot use pinning to pin documents that are not part of the current filter. This is to prevent,
+                // for example, unexpected interactions with tenant tokens.
+                if universe.remove(pin.id) {
+                    pins.push(pin);
+                }
+            }
+
+            for scale in scale {
+                if scales.len() >= fuel.max_scale_actions() {
+                    break;
+                }
+                let scale = scale?;
+                scales.push(scale);
+            }
+        }
+
+        Pin::dedup_and_sort(&mut pins);
+
+        let outcome = preview_outcome.map(|(_, outcome)| outcome);
+
+        Ok((pins, scales, outcome))
+    }
+
+    /// Provide access to the raw rule representation from an iterator of rule internal ids.
+    pub fn rules_from_rule_ids<I>(
+        self,
+        rule_ids: I,
+    ) -> Result<impl Iterator<Item = Result<DocumentFromDb<'a, FieldsIdsMap>>>>
+    where
+        I: IntoIterator<Item = RuleId>,
+    {
+        let metadata_id = self.metadata_internal_id()?;
+
+        Ok(rule_ids.into_iter().filter(move |rule_id| Some(*rule_id) != metadata_id).map(
+            move |rule_id| {
+                self.get_from_internal_id(rule_id)
+                    .transpose()
+                    .ok_or(UserError::UnknownInternalDocumentId { document_id: rule_id }.into())
+                    .flatten()
+            },
+        ))
+    }
+
+    /// Find the list of active or inactive rules, depending on `is_active`.
+    ///
+    /// If no rule contains the "active" field, then all declared rules are considered active.
+    pub fn active_rule_ids(&self, is_active: bool) -> Result<RoaringBitmap> {
+        let left_bound = if is_active { "true" } else { "false" };
+        let mut active_rules = if let Some(active_fid) = self.db_fields_ids_map.id(fields::ACTIVE) {
+            let active_key = FacetGroupKey { field_id: active_fid, level: 0, left_bound };
+            let Some(FacetGroupValue { size: _, bitmap: active_rules }) =
+                self.index.facet_id_string_docids.get(self.rtxn, &active_key)?
+            else {
+                return Ok(RoaringBitmap::new());
+            };
+            active_rules
+        } else if is_active {
+            self.index.documents_ids(self.rtxn)?
+        } else {
+            RoaringBitmap::default()
+        };
+        if let Some(metadata_id) = self.metadata_internal_id()? {
+            active_rules.remove(metadata_id);
+        }
+        Ok(active_rules)
+    }
+
+    /// A bitmap of all the rule internal ids.
+    ///
+    /// The internal ID of the special "metadata" document is excluded from the returned list.
+    pub fn all_rule_ids(&self) -> Result<RoaringBitmap> {
+        let mut all_rules = self.index.documents_ids(self.rtxn)?;
+        if let Some(metadata_id) = self.metadata_internal_id()? {
+            all_rules.remove(metadata_id);
+        }
+        Ok(all_rules)
+    }
+
+    /// Performs a search query against the rules specified in `universe` according to the following parameters:
+    ///
+    /// - `query`: String to look for (with a `Last` word matching strategy) in description and `query.words`
+    /// - `universe`: List of internal rule ids. It must not contain the internal id for the special "metadata" document.
+    pub fn search_in_description_and_words(
+        &self,
+        query: Option<String>,
+        universe: &RoaringBitmap,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchResult> {
+        let progress = Progress::quiet();
+        let mut search = self.index.search(
+            self.rtxn,
+            "",
+            self.db_fields_ids_map,
+            OffsetDateTime::now_utc(),
+            &progress,
+        );
+
+        if let Some(query) = query {
+            search.query(query);
+        }
+
+        search.candidates(universe);
+
+        search.exhaustive_number_hits(true);
+        search.limit(limit);
+        search.offset(offset);
+        search.sort_criteria(vec![AscDesc::Desc(crate::Member::Field(
+            fields::LAST_UPDATED_AT.into(),
+        ))]);
+        let searchable_attrs = [fields::DESCRIPTION.into(), fields::CONDITIONS_QUERY_WORDS.into()];
+        search.searchable_attributes(&searchable_attrs);
+
+        search.execute()
+    }
+
+    fn rule_ids_sorted_by_precedence(
+        this: Option<Self>,
+        active_rules: RoaringBitmap,
+        active_preview: Option<&RulePreviewWithId>,
+    ) -> Result<impl Iterator<Item = Result<RuleId>> + 'a> {
+        Ok(if let Some(this) = this {
+            either::Left(this.rule_ids_sorted_by_precedence_db(active_rules, active_preview)?)
+        } else {
+            either::Right(active_preview.map(|preview| Ok(preview.preview_id)).into_iter())
+        })
+    }
+
+    fn rule_ids_sorted_by_precedence_db(
+        self,
+        mut active_rules: RoaringBitmap,
+        active_preview: Option<&RulePreviewWithId>,
+    ) -> Result<impl Iterator<Item = Result<RuleId>> + 'a> {
+        if let Some(precedence_field_id) = self.db_fields_ids_map.id(fields::PRECEDENCE) {
+            // faceted = active rules with a non-null field
+            let mut faceted = self
+                .index
+                .facet_id_exists_docids
+                .get(self.rtxn, &precedence_field_id)?
+                .unwrap_or_default();
+
+            faceted &= &active_rules;
+            faceted -= self
+                .index
+                .facet_id_is_null_docids
+                .get(self.rtxn, &precedence_field_id)?
+                .unwrap_or_default();
+
+            // partition the active rules depending on whether they are faceted
+            active_rules -= &faceted;
+
+            let preview_id_precedence = if let Some(preview) = active_preview {
+                faceted.remove(preview.preview_id);
+                if let Some(precedence) = preview.preview.precedence.0 {
+                    Some((preview.preview_id, precedence))
+                } else {
+                    active_rules.insert(preview.preview_id);
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(either::Left(
+                self.ascending_rules(precedence_field_id, faceted, preview_id_precedence)?
+                    .chain(active_rules.into_iter().map(Ok)),
+            ))
+        } else {
+            let preview_prefix = if let Some(preview) = active_preview {
+                if preview.preview.precedence.0.is_some() {
+                    Some(preview.preview_id)
+                } else {
+                    active_rules.insert(preview.preview_id);
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(either::Right(preview_prefix.into_iter().chain(active_rules).map(Ok)))
+        }
+    }
+
+    fn ascending_rules(
+        self,
+        precedence_field_id: FieldId,
+        faceted: RoaringBitmap,
+        preview_id_precedence: Option<(RuleId, u64)>,
+    ) -> Result<impl Iterator<Item = Result<RuleId>> + 'a> {
+        let db = self.index.facet_id_f64_docids.remap_types();
+        Ok(itertools::merge_join_by(
+            ascending_facet_sort(self.rtxn, db, precedence_field_id, faceted)?,
+            preview_id_precedence,
+            |left, (_, right)| match left {
+                Ok((_, precedence)) => {
+                    let precedence = match OrderedF64Codec::bytes_decode(precedence) {
+                        Ok(precedence) => precedence as u64,
+                        Err(err) => {
+                            tracing::error!(
+                                "could not deserialize precedence from DB in dsr: {err}"
+                            );
+                            u64::MAX
+                        }
+                    };
+
+                    precedence.cmp(right)
+                }
+                Err(_) => Ordering::Greater,
+            },
+        )
+        .flat_map(|eob| match eob {
+            itertools::EitherOrBoth::Both(Ok((mut bucket, _)), (right, _)) => {
+                bucket.insert(right);
+                either::Left(bucket.into_iter().map(Ok))
+            }
+            itertools::EitherOrBoth::Left(Ok((bucket, _))) => {
+                either::Left(bucket.into_iter().map(Ok))
+            }
+            itertools::EitherOrBoth::Right((right, _)) => either::Right(std::iter::once(Ok(right))),
+            itertools::EitherOrBoth::Both(Err(err), _)
+            | itertools::EitherOrBoth::Left(Err(err)) => {
+                either::Right(std::iter::once(Err(err.into())))
+            }
+        }))
+    }
+}
+
+impl DynamicSearchRules {
+    /// Creates a new wrapper around the DSR index.
+    pub fn new(index: Index) -> Result<Self> {
+        let rtxn = index.static_read_txn()?;
+
+        let db_fields_ids_map = index.fields_ids_map(&rtxn)?;
+        Ok(Self { index, rtxn, db_fields_ids_map })
+    }
+
+    /// Returns the corresponding non-owning view.
+    pub fn as_view(&self) -> DynamicSearchRulesView<'_> {
+        DynamicSearchRulesView {
+            index: &self.index,
+            rtxn: &self.rtxn,
+            db_fields_ids_map: &self.db_fields_ids_map,
+        }
+    }
+
+    /// Returns the raw components making up this object.
+    pub fn as_raw(&self) -> (&Index, &RoTxn<'static, WithoutTls>, &FieldsIdsMap) {
+        (&self.index, &self.rtxn, &self.db_fields_ids_map)
+    }
+
+    /// Get the raw representation of a rule from its uid.
+    pub fn get<'t>(&'t self, rule_uid: &str) -> Result<Option<DocumentFromDb<'t, FieldsIdsMap>>> {
+        self.as_view().get(rule_uid)
+    }
+
+    /// `true` if the rule with the specified UID currently exists in the DSR index.
+    pub fn exists(&self, rule_uid: &str) -> Result<bool> {
+        self.as_view().exists(rule_uid)
+    }
+
+    /// Get the raw representation of a rule from its internal id.
+    pub fn get_from_internal_id<'t>(
+        &'t self,
+        rule_id: RuleId,
+    ) -> Result<Option<DocumentFromDb<'t, FieldsIdsMap>>> {
+        self.as_view().get_from_internal_id(rule_id)
+    }
+
+    /// Resolve the applicable actions for the given query.
+    pub fn resolve_actions(
+        this: Option<&Self>,
+        query_terms: &[LocatedQueryTerm],
+        filter: Option<&IndexFilter>,
+        universe: &mut RoaringBitmap,
+        search_context: &SearchContext,
+        fuel: DsrFuel,
+        preview: Option<&RulePreview>,
+    ) -> Result<(Vec<PinDoc>, Vec<ScaleDocs>, Option<ConditionOutcomes>)> {
+        DynamicSearchRulesView::resolve_actions(
+            this.map(Self::as_view),
+            query_terms,
+            filter,
+            universe,
+            search_context,
+            fuel,
+            preview,
+        )
+    }
+
+    /// Provide access to the raw rule representation from an iterator of rule internal ids.
+    pub fn rules_from_rule_ids<'t, I>(
+        &'t self,
+        rule_ids: I,
+    ) -> Result<impl Iterator<Item = Result<DocumentFromDb<'t, FieldsIdsMap>>>>
+    where
+        I: IntoIterator<Item = RuleId>,
+    {
+        self.as_view().rules_from_rule_ids(rule_ids)
+    }
+
+    /// Find the list of active or inactive rules, depending on `is_active`.
+    ///
+    /// If no rule contains the "active" field, then all declared rules are considered active.
+    pub fn active_rule_ids(&self, is_active: bool) -> Result<RoaringBitmap> {
+        self.as_view().active_rule_ids(is_active)
+    }
+
+    /// A bitmap of all the rule internal ids.
+    ///
+    /// The internal ID of the special "metadata" document is excluded from the returned list.
+    pub fn all_rule_ids(&self) -> Result<RoaringBitmap> {
+        self.as_view().all_rule_ids()
+    }
+
+    /// Performs a search query against the rules specified in `universe` according to the following parameters:
+    ///
+    /// - `query`: String to look for (with a `Last` word matching strategy) in description and `query.words`
+    /// - `universe`: List of internal rule ids. It must not contain the internal id for the special "metadata" document.
+    pub fn search_in_description_and_words(
+        &self,
+        query: Option<String>,
+        universe: &RoaringBitmap,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchResult> {
+        self.as_view().search_in_description_and_words(query, universe, limit, offset)
+    }
+}

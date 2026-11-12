@@ -1,0 +1,798 @@
+---
+source: crates/meilisearch/tests/upgrade/v1_12/v1_12_0.rs
+---
+{
+  "results": [
+    {
+      "uid": 30,
+      "progress": null,
+      "details": {
+        "upgradeFrom": "v1.12.0",
+        "upgradeTo": "[current version]"
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "upgradeDatabase": 1
+        },
+        "indexUids": {},
+        "progressTrace": "[progressTrace]"
+      },
+      "duration": "[duration]",
+      "startedAt": "[date]",
+      "finishedAt": "[date]",
+      "batchStrategy": "stopped after the last task of type `upgradeDatabase` because they cannot be batched with tasks of any other type."
+    },
+    {
+      "uid": 29,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.067201S",
+      "startedAt": "2025-07-07T13:43:08.772854Z",
+      "finishedAt": "2025-07-07T13:43:08.840055Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 28,
+      "progress": null,
+      "details": {
+        "deletedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "indexDeletion": 1
+        },
+        "indexUids": {
+          "mieli": 1
+        }
+      },
+      "duration": "PT0.012727S",
+      "startedAt": "2025-07-07T13:42:50.745461Z",
+      "finishedAt": "2025-07-07T13:42:50.758188Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 27,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 0
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "failed": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.059920S",
+      "startedAt": "2025-07-07T13:42:15.625413Z",
+      "finishedAt": "2025-07-07T13:42:15.685333Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 26,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "mieli": 1
+        }
+      },
+      "duration": "PT0.088879S",
+      "startedAt": "2025-07-07T13:40:01.461741Z",
+      "finishedAt": "2025-07-07T13:40:01.55062Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 25,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.312911S",
+      "startedAt": "2025-07-07T13:32:46.139785Z",
+      "finishedAt": "2025-07-07T13:32:46.452696Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 24,
+      "progress": null,
+      "details": {
+        "embedders": {
+          "doggo_embedder": {
+            "source": "huggingFace",
+            "model": "sentence-transformers/all-MiniLM-L6-v2",
+            "revision": "e4ce9877abf3edfe10b0d82785e83bdcb973e22e",
+            "documentTemplate": "{{doc.description}}"
+          }
+        }
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.247378S",
+      "startedAt": "2025-07-07T13:28:27.391344Z",
+      "finishedAt": "2025-07-07T13:28:27.638722Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 23,
+      "progress": null,
+      "details": {
+        "deletedDocuments": 0
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "indexDeletion": 1
+        },
+        "indexUids": {
+          "mieli": 1
+        }
+      },
+      "duration": "PT0.004146631S",
+      "startedAt": "2025-01-23T11:38:57.012591321Z",
+      "finishedAt": "2025-01-23T11:38:57.016737952Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 22,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.102738497S",
+      "startedAt": "2025-01-23T11:36:22.551906856Z",
+      "finishedAt": "2025-01-23T11:36:22.654645353Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 21,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 0
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "failed": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.005108474S",
+      "startedAt": "2025-01-23T11:36:04.132670526Z",
+      "finishedAt": "2025-01-23T11:36:04.137779Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 20,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 0
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "failed": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "mieli": 1
+        }
+      },
+      "duration": "PT0.027954894S",
+      "startedAt": "2025-01-23T11:35:53.631082795Z",
+      "finishedAt": "2025-01-23T11:35:53.659037689Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 19,
+      "progress": null,
+      "details": {
+        "deletedDocuments": 19546
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "indexDeletion": 1
+        },
+        "indexUids": {
+          "mieli": 1
+        }
+      },
+      "duration": "PT0.006903297S",
+      "startedAt": "2025-01-20T11:50:52.874106134Z",
+      "finishedAt": "2025-01-20T11:50:52.881009431Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 18,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 19547,
+        "indexedDocuments": 0,
+        "matchedTasks": 1,
+        "canceledTasks": 1,
+        "originalFilter": "?statuses=processing%2Cenqueued"
+      },
+      "stats": {
+        "totalNbTasks": 2,
+        "status": {
+          "succeeded": 1,
+          "canceled": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1,
+          "taskCancelation": 1
+        },
+        "indexUids": {
+          "mieli": 1
+        }
+      },
+      "duration": "PT0.000481257S",
+      "startedAt": "2025-01-20T11:48:04.92820416Z",
+      "finishedAt": "2025-01-20T11:48:04.928685417Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 17,
+      "progress": null,
+      "details": {
+        "matchedTasks": 0,
+        "canceledTasks": 0,
+        "originalFilter": "?statuses=processing%2Cenqueued"
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "taskCancelation": 1
+        },
+        "indexUids": {}
+      },
+      "duration": "PT0.000407005S",
+      "startedAt": "2025-01-20T11:47:53.509403957Z",
+      "finishedAt": "2025-01-20T11:47:53.509810962Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 16,
+      "progress": null,
+      "details": {
+        "matchedTasks": 0,
+        "canceledTasks": 0,
+        "originalFilter": "?statuses=processing%2Cenqueued"
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "taskCancelation": 1
+        },
+        "indexUids": {}
+      },
+      "duration": "PT0.000403716S",
+      "startedAt": "2025-01-20T11:47:48.430653005Z",
+      "finishedAt": "2025-01-20T11:47:48.431056721Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 15,
+      "progress": null,
+      "details": {
+        "matchedTasks": 0,
+        "canceledTasks": 0,
+        "originalFilter": "?statuses=processing"
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "taskCancelation": 1
+        },
+        "indexUids": {}
+      },
+      "duration": "PT0.000417016S",
+      "startedAt": "2025-01-20T11:47:42.429678617Z",
+      "finishedAt": "2025-01-20T11:47:42.430095633Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 14,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 19547,
+        "indexedDocuments": 19546
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "mieli": 1
+        }
+      },
+      "duration": "PT12.086284842S",
+      "startedAt": "2025-01-20T11:47:03.092181576Z",
+      "finishedAt": "2025-01-20T11:47:15.178466418Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 13,
+      "progress": null,
+      "details": {
+        "localizedAttributes": [
+          {
+            "attributePatterns": [
+              "description"
+            ],
+            "locales": [
+              "fr"
+            ]
+          }
+        ]
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.011506614S",
+      "startedAt": "2025-01-16T17:18:43.29334923Z",
+      "finishedAt": "2025-01-16T17:18:43.304855844Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 12,
+      "progress": null,
+      "details": {
+        "faceting": {
+          "sortFacetValuesBy": {
+            "*": "alpha",
+            "age": "count"
+          }
+        }
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.007640163S",
+      "startedAt": "2025-01-16T17:02:52.539749853Z",
+      "finishedAt": "2025-01-16T17:02:52.547390016Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 11,
+      "progress": null,
+      "details": {
+        "searchCutoffMs": 8000
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.007307840S",
+      "startedAt": "2025-01-16T17:01:14.112756687Z",
+      "finishedAt": "2025-01-16T17:01:14.120064527Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 10,
+      "progress": null,
+      "details": {
+        "faceting": {
+          "maxValuesPerFacet": 99
+        },
+        "pagination": {
+          "maxTotalHits": 15
+        }
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.007391353S",
+      "startedAt": "2025-01-16T17:00:29.201180268Z",
+      "finishedAt": "2025-01-16T17:00:29.208571621Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 9,
+      "progress": null,
+      "details": {
+        "faceting": {
+          "maxValuesPerFacet": 100
+        },
+        "pagination": {
+          "maxTotalHits": 1000
+        }
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.007445825S",
+      "startedAt": "2025-01-16T17:00:15.77629445Z",
+      "finishedAt": "2025-01-16T17:00:15.783740275Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 8,
+      "progress": null,
+      "details": {
+        "typoTolerance": {
+          "minWordSizeForTypos": {
+            "oneTypo": 4
+          },
+          "disableOnWords": [
+            "kefir"
+          ],
+          "disableOnAttributes": [
+            "surname"
+          ]
+        }
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.012020083S",
+      "startedAt": "2025-01-16T16:59:42.744086671Z",
+      "finishedAt": "2025-01-16T16:59:42.756106754Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 7,
+      "progress": null,
+      "details": {
+        "typoTolerance": {
+          "minWordSizeForTypos": {
+            "oneTypo": 4
+          }
+        }
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.007440092S",
+      "startedAt": "2025-01-16T16:58:41.2155771Z",
+      "finishedAt": "2025-01-16T16:58:41.223017192Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 6,
+      "progress": null,
+      "details": {
+        "synonyms": {
+          "boubou": [
+            "kefir"
+          ]
+        }
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.007565161S",
+      "startedAt": "2025-01-16T16:54:51.940332781Z",
+      "finishedAt": "2025-01-16T16:54:51.947897942Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 5,
+      "progress": null,
+      "details": {
+        "stopWords": [
+          "le",
+          "un"
+        ]
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.016307263S",
+      "startedAt": "2025-01-16T16:53:19.913351957Z",
+      "finishedAt": "2025-01-16T16:53:19.92965922Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 4,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.087655941S",
+      "startedAt": "2025-01-16T16:52:32.631145531Z",
+      "finishedAt": "2025-01-16T16:52:32.718801472Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 3,
+      "progress": null,
+      "details": {
+        "sortableAttributes": [
+          "age"
+        ]
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.007593573S",
+      "startedAt": "2025-01-16T16:47:53.677901409Z",
+      "finishedAt": "2025-01-16T16:47:53.685494982Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 2,
+      "progress": null,
+      "details": {
+        "filterableAttributes": [
+          "age",
+          "surname"
+        ]
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "settingsUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.017769760S",
+      "startedAt": "2025-01-16T16:47:41.211587682Z",
+      "finishedAt": "2025-01-16T16:47:41.229357442Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 1,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.066095506S",
+      "startedAt": "2025-01-16T16:47:10.217299609Z",
+      "finishedAt": "2025-01-16T16:47:10.283395115Z",
+      "batchStrategy": "unspecified"
+    },
+    {
+      "uid": 0,
+      "progress": null,
+      "details": {
+        "receivedDocuments": 1,
+        "indexedDocuments": 1
+      },
+      "stats": {
+        "totalNbTasks": 1,
+        "status": {
+          "succeeded": 1
+        },
+        "types": {
+          "documentAdditionOrUpdate": 1
+        },
+        "indexUids": {
+          "kefir": 1
+        }
+      },
+      "duration": "PT0.111055654S",
+      "startedAt": "2025-01-16T16:45:16.020248085Z",
+      "finishedAt": "2025-01-16T16:45:16.131303739Z",
+      "batchStrategy": "unspecified"
+    }
+  ],
+  "total": 31,
+  "limit": 1000,
+  "from": 30,
+  "next": null
+}

@@ -1,30 +1,24 @@
 name: Bench (manual)
 
 on:
-    workflow_dispatch:
-        inputs:
-            workload:
-                description: 'The path to the workloads to execute (workloads/...)'
-                required: true
-                default: 'workloads/movies.json'
+  workflow_dispatch:
+    inputs:
+      workload:
+        description: "The path to the workloads to execute (workloads/...)"
+        required: true
+        default: "workloads/movies.json"
 
 env:
-    WORKLOAD_NAME: ${{ github.event.inputs.workload }}
+  WORKLOAD_NAME: ${{ github.event.inputs.workload }}
 
 jobs:
-    benchmarks:
-        name: Run and upload benchmarks
-        runs-on: benchmarks
-        timeout-minutes: 180 # 3h
-        steps:
-            - uses: actions/checkout@v3
-            - uses: actions-rs/toolchain@v1
-              with:
-                profile: minimal
-                toolchain: stable
-                override: true
+  benchmarks:
+    name: Run and upload benchmarks
+    runs-on: benchmarks
+    timeout-minutes: 180 # 3h
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-            - name: Run benchmarks - workload ${WORKLOAD_NAME} - branch ${{ github.ref }} - commit ${{ github.sha }}
-              run: |
-               cargo xtask bench --api-key "${{ secrets.BENCHMARK_API_KEY }}" --dashboard-url "${{ vars.BENCHMARK_DASHBOARD_URL }}" --reason "Manual [Run #${{ github.run_id }}](https://github.com/meilisearch/meilisearch/actions/runs/${{ github.run_id }})" -- ${WORKLOAD_NAME}
-
+      - name: Run benchmarks - workload ${WORKLOAD_NAME} - branch ${{ github.ref }} - commit ${{ github.sha }}
+        run: |
+          cargo xtask bench --api-key "${{ secrets.BENCHMARK_API_KEY }}" --dashboard-url "${{ vars.BENCHMARK_DASHBOARD_URL }}" --reason "Manual [Run #${{ github.run_id }}](https://github.com/meilisearch/meilisearch/actions/runs/${{ github.run_id }})" -- ${WORKLOAD_NAME}

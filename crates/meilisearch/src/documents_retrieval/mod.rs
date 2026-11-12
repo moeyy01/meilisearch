@@ -1,0 +1,538 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+
+use actix_web::web::Data;
+use index_scheduler::{IndexScheduler, RoFeatures};
+use indexmap::IndexMap;
+use meilisearch_auth::AuthFilter;
+use meilisearch_types::error::{AuthenticationError, Code, ResponseError};
+use meilisearch_types::milli::progress::Progress;
+use meilisearch_types::milli::search::steps::{PerformRetrievalStep, TotalProcessingTimeStep};
+use uuid::Uuid;
+
+use crate::error::MeilisearchHttpError;
+use crate::extractors::authentication::policies::ActionPolicy;
+use crate::extractors::authentication::GuardedData;
+use crate::personalization::PersonalizationService;
+use crate::routes::indexes::documents::{BrowseQueryWithIndex, DocumentsResult};
+use crate::search::federated::types::{PreprocessableQuery, PreprocessedQuery};
+use crate::search::federated::NetworkPartitioner;
+use crate::search::proxy::{json_proxy, ProxySearchError, ProxySearchParams};
+use crate::search::{
+    add_search_rules, perform_federated_search, FederatedSearchResult, Federation,
+    SearchQueryWithIndex, SearchResult, SearchResultWithIndex, ShowFederationInfo,
+};
+
+pub use preprocessing::{preprocess_filters, retrieve_foreign_keys_settings};
+
+pub use hydration::{hydrate_documents, FederatedHydrationFormatter, HydrationContext};
+
+mod hydration;
+mod preprocessing;
+
+pub type RemoteErrors = BTreeMap<String, ResponseError>;
+
+pub struct DocumentSearch {
+    personalization_service: Arc<PersonalizationService>,
+    is_proxy: bool,
+    include_metadata: bool,
+    request_uid: Uuid,
+}
+
+impl DocumentSearch {
+    pub fn new(
+        personalization_service: Arc<PersonalizationService>,
+        is_proxy: bool,
+        include_metadata: bool,
+        request_uid: Uuid,
+    ) -> Self {
+        Self { personalization_service, is_proxy, include_metadata, request_uid }
+    }
+
+    pub async fn execute_federated<const P: u8>(
+        self,
+        queries: Vec<SearchQueryWithIndex>,
+        federation: Federation,
+        guarded_index_scheduler: GuardedData<ActionPolicy<P>, Data<IndexScheduler>>,
+        progress: Progress,
+    ) -> Result<(FederatedSearchResult, IndexMap<String, String>), (ResponseError, Option<usize>)>
+    {
+        let search = FederatedSearch { federation };
+        self.execute(search, queries, guarded_index_scheduler, progress).await
+    }
+
+    pub async fn execute_single<const P: u8>(
+        self,
+        query: SearchQueryWithIndex,
+        guarded_index_scheduler: GuardedData<ActionPolicy<P>, Data<IndexScheduler>>,
+        progress: Progress,
+    ) -> Result<(SearchResult, IndexMap<String, String>), ResponseError> {
+        match self.execute_multi(vec![query], guarded_index_scheduler, progress).await {
+            Ok((mut search_results, mut progress)) => {
+                let (_, progress) = progress.pop().unwrap();
+                let search_result = search_results.pop().unwrap();
+                Ok((search_result.result, progress))
+            }
+            Err((err, _)) => Err(err),
+        }
+    }
+
+    pub async fn execute_multi<const P: u8>(
+        self,
+        queries: Vec<SearchQueryWithIndex>,
+        guarded_index_scheduler: GuardedData<ActionPolicy<P>, Data<IndexScheduler>>,
+        progress: Progress,
+    ) -> Result<
+        (Vec<SearchResultWithIndex>, IndexMap<String, IndexMap<String, String>>),
+        (ResponseError, Option<usize>),
+    > {
+        let search = MultiSearch;
+        self.execute(search, queries, guarded_index_scheduler, progress).await
+    }
+
+    async fn execute<S, const P: u8>(
+        self,
+        search: S,
+        mut queries: Vec<S::Input>,
+        guarded_index_scheduler: GuardedData<ActionPolicy<P>, Data<IndexScheduler>>,
+        progress: Progress,
+    ) -> Result<(S::Output, S::ProgressTrace), (ResponseError, Option<usize>)>
+    where
+        S: MultiQuerySearch,
+    {
+        // regardless of federation, check authorization and apply search rules
+        let auth_filter = guarded_index_scheduler.filters();
+        'check_authorization: {
+            for (query_index, federated_query) in queries.iter_mut().enumerate() {
+                let index_uid = federated_query.index_uid().as_str();
+                // Check index from API key
+                if !auth_filter.is_index_authorized(index_uid) {
+                    break 'check_authorization Err(AuthenticationError::InvalidToken)
+                        .with_index(query_index);
+                }
+                // Apply search rules from tenant token
+                if let Some(search_rules) = auth_filter.get_index_search_rules(index_uid) {
+                    add_search_rules(federated_query.filter_field(), search_rules);
+                }
+            }
+            Ok(())
+        }?;
+
+        let index_scheduler = guarded_index_scheduler.clone();
+        let features = index_scheduler.features();
+
+        let network_partitioner = NetworkPartitioner::new(&index_scheduler);
+        let (hydration_cache, preprocessed_queries, remote_errors) = preprocess_filters(
+            index_scheduler.clone(),
+            &network_partitioner,
+            queries,
+            features,
+            self.is_proxy,
+            &progress,
+            auth_filter,
+            Code::InvalidSearchFilter,
+        )
+        .await?;
+
+        let network_partitioner = &network_partitioner;
+        let context = ExecutionContext {
+            index_scheduler,
+            network_partitioner,
+            hydration_cache,
+            remote_errors,
+            features,
+            document_search: self,
+            progress,
+            auth_filter,
+        };
+
+        search.execute(preprocessed_queries, context).await
+    }
+}
+
+struct ExecutionContext<'a> {
+    index_scheduler: Data<IndexScheduler>,
+    network_partitioner: &'a NetworkPartitioner,
+    hydration_cache: Option<HydrationContext>,
+    remote_errors: RemoteErrors,
+    features: RoFeatures,
+    document_search: DocumentSearch,
+    progress: Progress,
+    auth_filter: &'a AuthFilter,
+}
+
+trait MultiQuerySearch {
+    type Input: PreprocessableQuery;
+    type Output;
+    type ProgressTrace;
+
+    async fn execute(
+        self,
+        queries: Vec<PreprocessedQuery<Self::Input>>,
+        context: ExecutionContext,
+    ) -> Result<(Self::Output, Self::ProgressTrace), (ResponseError, Option<usize>)>;
+}
+
+struct FederatedSearch {
+    federation: Federation,
+}
+
+impl MultiQuerySearch for FederatedSearch {
+    type Input = SearchQueryWithIndex;
+    type Output = FederatedSearchResult;
+    type ProgressTrace = IndexMap<String, String>;
+    async fn execute(
+        self,
+        queries: Vec<PreprocessedQuery<SearchQueryWithIndex>>,
+        ExecutionContext {
+            index_scheduler,
+            network_partitioner,
+            hydration_cache,
+            remote_errors,
+            features,
+            document_search:
+                DocumentSearch { personalization_service, is_proxy, include_metadata, request_uid },
+            progress,
+            auth_filter,
+        }: ExecutionContext<'_>,
+    ) -> Result<(Self::Output, Self::ProgressTrace), (ResponseError, Option<usize>)> {
+        progress.update_progress(TotalProcessingTimeStep::Process);
+        let (search_result, _) = perform_federated_search(
+            index_scheduler,
+            network_partitioner,
+            queries,
+            hydration_cache,
+            remote_errors,
+            self.federation,
+            features,
+            is_proxy,
+            request_uid,
+            include_metadata,
+            ShowFederationInfo::Always,
+            &personalization_service,
+            &progress,
+            auth_filter,
+        )
+        .await?;
+        Ok((search_result, progress.accumulated_durations()))
+    }
+}
+
+struct MultiSearch;
+
+impl MultiQuerySearch for MultiSearch {
+    type Input = SearchQueryWithIndex;
+    type Output = Vec<SearchResultWithIndex>;
+    type ProgressTrace = IndexMap<String, IndexMap<String, String>>;
+    async fn execute(
+        self,
+        queries: Vec<PreprocessedQuery<SearchQueryWithIndex>>,
+        ExecutionContext {
+            index_scheduler,
+            network_partitioner,
+            hydration_cache,
+            remote_errors,
+            features,
+            document_search:
+                DocumentSearch { personalization_service, is_proxy, include_metadata, request_uid },
+            progress,
+            auth_filter,
+        }: ExecutionContext<'_>,
+    ) -> Result<(Self::Output, Self::ProgressTrace), (ResponseError, Option<usize>)> {
+        let search_results: Result<_, (ResponseError, _)> = async {
+            let mut multi_search_progress = progress;
+            let mut search_results = Vec::with_capacity(queries.len());
+            let mut progress_by_query = IndexMap::with_capacity(queries.len());
+            for (query_index, query) in queries.into_iter().enumerate() {
+                // recreate the progress for each query to reset the time tracking
+                let progress = multi_search_progress;
+                multi_search_progress = progress.recreate();
+
+                progress.update_progress(TotalProcessingTimeStep::Process);
+                if query.query.federation_options.is_some() {
+                    return Err((
+                        MeilisearchHttpError::FederationOptionsInNonFederatedRequest.into(),
+                        Some(query_index),
+                    ));
+                }
+
+                let (q, index_uid, fixed_query, federation) = {
+                    let PreprocessedQuery { query, filter } = query;
+                    let q = query.q.clone();
+                    let index_uid = query.index_uid.to_string();
+                    let (fixed_query, federation) = fixup_query_federation(&query);
+
+                    (q, index_uid, PreprocessedQuery { query: fixed_query, filter }, federation)
+                };
+
+                let (search_result, _) = perform_federated_search(
+                    index_scheduler.clone(),
+                    network_partitioner,
+                    vec![fixed_query],
+                    hydration_cache.clone(),
+                    remote_errors.clone(),
+                    federation,
+                    features,
+                    is_proxy,
+                    request_uid,
+                    include_metadata,
+                    ShowFederationInfo::OnNetworkOnly,
+                    &personalization_service,
+                    &progress,
+                    auth_filter,
+                )
+                .await
+                // Fixup the query index for the error
+                .map_err(|(err, _)| (err, Some(query_index)))?;
+
+                // Because progress by query is an IndexMap<String, _> we need to format the query index as a string
+                progress_by_query
+                    .insert(format!("query[{}]", query_index), progress.accumulated_durations());
+                search_results.push(SearchResultWithIndex {
+                    result: search_result
+                        .into_search_result(q.unwrap_or_default(), index_uid.as_str()),
+                    index_uid,
+                });
+            }
+
+            Ok((search_results, progress_by_query))
+        }
+        .await;
+
+        search_results
+    }
+}
+
+pub fn fixup_query_federation(query: &SearchQueryWithIndex) -> (SearchQueryWithIndex, Federation) {
+    let mut query = query.clone();
+    // Move query parameters that make sense at the federation level
+    // from the `SearchQueryWithIndex` to the `Federation`
+    let SearchQueryWithIndex {
+        index_uid,
+        q: _,
+        vector: _,
+        media: _,
+        hybrid: _,
+        offset,
+        limit,
+        page,
+        hits_per_page,
+        attributes_to_retrieve: _,
+        retrieve_vectors: _,
+        attributes_to_crop: _,
+        crop_length: _,
+        attributes_to_highlight: _,
+        show_ranking_score: _,
+        show_ranking_score_details: _,
+        show_performance_details,
+        use_network: _,
+        show_matches_position: _,
+        filter: _,
+        sort: _,
+        distinct,
+        facets,
+        highlight_pre_tag: _,
+        highlight_post_tag: _,
+        crop_marker: _,
+        matching_strategy: _,
+        attributes_to_search_on: _,
+        ranking_score_threshold: _,
+        locales: _,
+        personalize,
+        federation_options: _,
+        inline_rule: _,
+    } = &mut query;
+
+    let mut federation = Federation::default();
+    let Federation {
+        limit: federation_limit,
+        offset: federation_offset,
+        page: federation_page,
+        hits_per_page: federation_hits_per_page,
+        facets_by_index: _,
+        merge_facets: _,
+        show_performance_details: federation_show_performance_details,
+        distinct: federation_distinct,
+        personalize: federation_personalize,
+    } = &mut federation;
+
+    if let Some(limit) = limit.take() {
+        *federation_limit = limit;
+    }
+    if let Some(offset) = offset.take() {
+        *federation_offset = offset;
+    }
+    if let Some(page) = page.take() {
+        *federation_page = Some(page);
+    }
+    if let Some(hits_per_page) = hits_per_page.take() {
+        *federation_hits_per_page = Some(hits_per_page);
+    }
+    if let Some(distinct) = distinct.take() {
+        *federation_distinct = Some(distinct);
+    }
+
+    if let Some(show_performance_details) = show_performance_details.take() {
+        *federation_show_performance_details = show_performance_details;
+    }
+
+    if let Some(personalize) = personalize.take() {
+        *federation_personalize = Some(personalize);
+    }
+
+    'facets: {
+        if let Some(facets) = facets.take() {
+            if facets.is_empty() {
+                break 'facets;
+            }
+            let facets_by_index = federation.facets_by_index.entry(index_uid.clone()).or_default();
+            *facets_by_index = Some(facets);
+        }
+    }
+
+    (query, federation)
+}
+
+/// Local `Result` extension trait to avoid `map_err` boilerplate.
+pub trait WithIndex {
+    type T;
+    /// convert the error type inside of the `Result` to a `ResponseError`, and
+    /// return a couple of it + the query index.
+    fn with_index(self, index: usize) -> Result<Self::T, (ResponseError, Option<usize>)>;
+
+    /// convert the error type inside of the `Result` to a `ResponseError`, and
+    /// return a couple of it + empty query index.
+    fn without_index(self) -> Result<Self::T, (ResponseError, Option<usize>)>;
+}
+
+impl<T, E: Into<ResponseError>> WithIndex for Result<T, E> {
+    type T = T;
+    fn with_index(self, index: usize) -> Result<T, (ResponseError, Option<usize>)> {
+        self.map_err(|err| (err.into(), Some(index)))
+    }
+
+    fn without_index(self) -> Result<T, (ResponseError, Option<usize>)> {
+        self.map_err(|err| (err.into(), None))
+    }
+}
+
+const MAX_IN_FLIGHT_REQUESTS: usize = 40;
+
+pub struct RemoteRetrieveDocuments<T> {
+    errors: BTreeMap<String, ResponseError>,
+    results: Vec<(T, DocumentsResult)>,
+    #[allow(clippy::type_complexity)]
+    in_flight_requests:
+        VecDeque<(tokio::task::JoinHandle<Result<DocumentsResult, ProxySearchError>>, String, T)>,
+}
+
+impl<T: Clone> RemoteRetrieveDocuments<T> {
+    pub async fn start(
+        network_partitioner: &NetworkPartitioner,
+        params: ProxySearchParams,
+        remote_queries: Vec<(T, PreprocessedQuery<BrowseQueryWithIndex>)>,
+        progress: &Progress,
+    ) -> Result<Self, ResponseError> {
+        let _step = progress.update_progress_scoped(PerformRetrievalStep::SendToRemote);
+        let mut errors = BTreeMap::new();
+        let mut results = Vec::with_capacity(remote_queries.len());
+        let mut in_flight_requests = VecDeque::with_capacity(MAX_IN_FLIGHT_REQUESTS);
+
+        for (metadata, query) in remote_queries {
+            let BrowseQueryWithIndex { query, remote: Some(remote_name), index_uid } =
+                query.into_inner_preprocessed()
+            else {
+                unreachable!("remote query must have a remote name");
+            };
+
+            let Some(remote) = network_partitioner.get_remote(&remote_name) else {
+                errors.insert(
+                    remote_name.clone(),
+                    ProxySearchError::UnknownRemote { remote: remote_name.clone() }
+                        .as_response_error(),
+                );
+                continue;
+            };
+
+            let path_and_query =
+                match meilisearch_types::network::route::documents_fetch_path(&index_uid) {
+                    Ok(path_and_query) => path_and_query,
+                    Err(err) => {
+                        errors.insert(
+                            remote_name.clone(),
+                            ProxySearchError::InvalidRemoteUrl { cause: err.to_string() }
+                                .as_response_error(),
+                        );
+                        continue;
+                    }
+                };
+
+            let request = match json_proxy(
+                path_and_query,
+                http_client::reqwest::Method::POST,
+                remote,
+                &query,
+                &params,
+                false, // no metadata on documents-fetch
+            ) {
+                Ok(request) => request,
+                Err(err) => {
+                    errors.insert(remote_name.clone(), err.as_response_error());
+                    continue;
+                }
+            };
+
+            if in_flight_requests.len() == in_flight_requests.capacity() {
+                // unwrap: MAX_IN_FLIGHT_REQUESTS > 0
+                // TODO: popping the front doesn't guarantee to wait for the fastest request
+                // It would be preferable to use [a `FuturesUnordered` type](https://docs.rs/futures/latest/futures/stream/futures_unordered/struct.FuturesUnordered.html) instead.
+                let (task, remote_name, metadata): (
+                    tokio::task::JoinHandle<Result<DocumentsResult, ProxySearchError>>,
+                    _,
+                    _,
+                ) = in_flight_requests.pop_front().unwrap();
+                match task.await.unwrap() {
+                    Ok(result) => results.push((metadata, result)),
+                    Err(err) => {
+                        errors.insert(remote_name, err.as_response_error());
+                        continue;
+                    }
+                }
+            }
+            in_flight_requests.push_back((
+                tokio::spawn(request),
+                remote_name.clone(),
+                metadata.clone(),
+            ));
+        }
+
+        Ok(Self { errors, results, in_flight_requests })
+    }
+
+    pub async fn finish(
+        self,
+        index_scheduler: &IndexScheduler,
+        progress: &Progress,
+    ) -> Result<(Vec<(T, DocumentsResult)>, RemoteErrors), ResponseError> {
+        let _step = progress.update_progress_scoped(PerformRetrievalStep::WaitForRemote);
+        let Self { mut results, mut errors, in_flight_requests } = self;
+        // Retrieve remote results
+        for (task, remote_name, metadata) in in_flight_requests {
+            match task.await.unwrap() {
+                Ok(result) => results.push((metadata, result)),
+                Err(err) => {
+                    errors.insert(remote_name, err.as_response_error());
+                }
+            }
+        }
+
+        // Mark remote as unavailable if error is server error
+        for (remote_name, error) in errors.iter() {
+            if error.code.is_server_error() {
+                index_scheduler.mark_remote_unavailable(remote_name.clone())?;
+            }
+        }
+
+        Ok((results, errors))
+    }
+}

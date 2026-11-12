@@ -1,0 +1,633 @@
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+
+use deserr::{DeserializeError, Deserr, ErrorKind, ValuePointerRef};
+use milli::dynamic_search_rules::RuleActions;
+use milli::update::new::document::Document;
+use milli::update::Setting;
+use milli::FaultSource;
+use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+use utoipa::ToSchema;
+
+use crate::deserr::DeserrJsonError;
+use crate::error::deserr_codes::{
+    InvalidDynamicSearchRuleActions, InvalidDynamicSearchRuleActive,
+    InvalidDynamicSearchRuleConditions, InvalidDynamicSearchRuleDescription,
+    InvalidDynamicSearchRulePriority,
+};
+use crate::error::ParseOffsetDateTimeError;
+use crate::index_uid::IndexUid;
+use crate::tasks::TaskId;
+
+pub type RuleUid = IndexUid;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(rename_all = "camelCase")]
+pub struct DynamicSearchRule {
+    /// Unique identifier of the dynamic search rule.
+    pub uid: RuleUid,
+    /// Human-readable description of the dynamic search rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Date time of the last update of this rule.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_updated_at: Option<OffsetDateTime>,
+
+    /// Precedence of the dynamic search rule. Lower numeric values take precedence over higher
+    /// ones. If omitted, the rule is treated as having the lowest precedence. This precedence is
+    /// used to resolve conflicts between matching rules:
+    /// - If the same document is selected by multiple rules, the smallest `priority` number wins
+    /// - If different documents are pinned to the same position, they are ordered by ascending `priority`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precedence: Option<u64>,
+    /// Whether the dynamic search rule is active.
+    #[serde(default = "default_dynamic_search_rule_active")]
+    pub active: bool,
+    /// Conditions that must match before the dynamic search rule applies.
+    #[serde(default)]
+    pub conditions: Conditions,
+    /// Actions to apply when the dynamic search rule matches.
+    #[serde(default)]
+    pub actions: RuleActions,
+}
+
+impl DynamicSearchRule {
+    pub fn new(uid: RuleUid) -> Self {
+        Self {
+            uid,
+            description: None,
+            precedence: None,
+            last_updated_at: None,
+            active: true,
+            conditions: Default::default(),
+            actions: Default::default(),
+        }
+    }
+
+    pub fn try_from_meili_doc<'a>(
+        doc: impl Document<'a>,
+        fault_source: FaultSource,
+    ) -> Result<Self, milli::Error> {
+        use milli::dynamic_search_rules::fields as dsr_fields;
+
+        let to_milli_error = |err| match fault_source {
+            FaultSource::User => milli::Error::UserError(milli::UserError::SerdeJson(err)),
+            FaultSource::Runtime | FaultSource::Bug | FaultSource::Undecided => {
+                milli::Error::InternalError(milli::InternalError::SerdeJson(err))
+            }
+        };
+
+        let uid = serde_json::from_str(
+            doc.top_level_field(dsr_fields::UID)?
+                .ok_or_else(|| match fault_source {
+                    FaultSource::User => {
+                        milli::Error::UserError(milli::UserError::MissingDocumentId {
+                            primary_key: dsr_fields::UID.to_string(),
+                            document: Default::default(),
+                        })
+                    }
+                    FaultSource::Runtime | FaultSource::Bug | FaultSource::Undecided => {
+                        milli::Error::InternalError(milli::InternalError::DatabaseMissingEntry {
+                            db_name: "dsr index",
+                            key: None,
+                        })
+                    }
+                })?
+                .get(),
+        )
+        .map_err(to_milli_error)?;
+        let description = match doc.top_level_field(dsr_fields::DESCRIPTION)? {
+            // we deserialize the description as an Option rather than hardcoding Some here,
+            // because the description could be an explicit `null`
+            Some(description) => serde_json::from_str(description.get()).map_err(to_milli_error)?,
+            None => None,
+        };
+
+        let precedence = match doc.top_level_field(dsr_fields::PRECEDENCE)? {
+            Some(precedence) => serde_json::from_str(precedence.get()).map_err(to_milli_error)?,
+            None => None,
+        };
+
+        let last_updated_at = match doc.top_level_field(dsr_fields::LAST_UPDATED_AT)? {
+            Some(updated_at) => {
+                let last_updated_at = time::serde::rfc3339::option::deserialize(updated_at)
+                    .map_err(to_milli_error)?;
+
+                last_updated_at
+            }
+            None => Default::default(),
+        };
+
+        let active = match doc.top_level_field(dsr_fields::ACTIVE)? {
+            Some(active) => serde_json::from_str(active.get()).map_err(to_milli_error)?,
+            // `active` defaults to true!
+            None => true,
+        };
+
+        let conditions = match doc.top_level_field(dsr_fields::CONDITIONS)? {
+            Some(conditions) => serde_json::from_str(conditions.get()).map_err(to_milli_error)?,
+            None => Default::default(),
+        };
+
+        let actions = match doc.top_level_field(dsr_fields::ACTIONS)? {
+            Some(actions) => serde_json::from_str(actions.get())
+                // note: allow "corrupted" actions with a log, required during instance upgrade
+                .inspect_err(|err| {
+                    tracing::warn!("Could not deserialize action for rule `{uid}`: {err}")
+                })
+                .unwrap_or(Default::default()),
+            None => Default::default(),
+        };
+
+        Ok(Self { uid, description, last_updated_at, precedence, active, conditions, actions })
+    }
+
+    pub fn into_uid_update(self) -> (RuleUid, DynamicSearchRuleUpdateRequest) {
+        let Self { uid, description, last_updated_at: _, precedence, active, conditions, actions } =
+            self;
+        (
+            uid,
+            DynamicSearchRuleUpdateRequest {
+                description: Setting::some_or_not_set(description),
+                precedence: Setting::some_or_not_set(precedence),
+                active: Setting::Set(active),
+                conditions: Setting::Set(conditions),
+                actions: Setting::Set(actions),
+            },
+        )
+    }
+
+    pub fn apply_update(
+        &mut self,
+        update: DynamicSearchRuleUpdateRequest,
+        updated_at: OffsetDateTime,
+    ) {
+        let Self { uid: _, description, last_updated_at, precedence, active, conditions, actions } =
+            self;
+
+        let DynamicSearchRuleUpdateRequest {
+            description: new_description,
+            precedence: new_precedence,
+            active: new_active,
+            conditions: new_conditions,
+            actions: new_actions,
+        } = update;
+
+        *description = match new_description {
+            Setting::Set(new_description) => Some(new_description),
+            Setting::Reset => None,
+            Setting::NotSet => description.take(),
+        };
+        *precedence = match new_precedence {
+            Setting::Set(new_precedence) => Some(new_precedence),
+            Setting::Reset => None,
+            Setting::NotSet => precedence.take(),
+        };
+
+        *active = match new_active {
+            Setting::Set(new_active) => new_active,
+            Setting::Reset => true,
+            Setting::NotSet => *active,
+        };
+
+        *last_updated_at = Some(updated_at);
+
+        match new_conditions {
+            Setting::Set(Conditions { time: new_time, query: new_query, filter: new_filter }) => {
+                let Conditions { time, query, filter } = conditions;
+                *time = new_time;
+                *query = new_query;
+                *filter = new_filter;
+            }
+            Setting::Reset => *conditions = Conditions::default(),
+            Setting::NotSet => (),
+        }
+
+        // for consistency with conditions, we are not allowing partial updates of actions.
+        // Any action update rewrites the entire action subobject.
+        // this is not consistent with how we usually do things in Meilisearch API,
+        // but should not be an issue for use from the UI which tends to send back the entire rule object anyway.
+        *actions = match new_actions {
+            Setting::Set(new_actions) => new_actions,
+            Setting::Reset => Default::default(),
+            Setting::NotSet => std::mem::take(actions),
+        };
+    }
+
+    pub fn facet_count(&self) -> usize {
+        let Some(filter) = self.conditions.filter.as_ref() else {
+            return 0;
+        };
+
+        let mut count = 0;
+        for value in filter.values.values() {
+            count_value(value, &mut count);
+        }
+        count
+    }
+}
+
+fn count_value(value: &serde_json::Value, count: &mut usize) {
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::String(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Bool(_) => {
+            *count += 1;
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                count_value(value, count)
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                count_value(value, count);
+            }
+        }
+    }
+}
+
+const fn default_dynamic_search_rule_active() -> bool {
+    true
+}
+
+#[routes::request(db, setting)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DynamicSearchRuleUpdateRequest {
+    /// Human-readable description of the dynamic search rule.
+    #[request(default, error = DeserrJsonError<InvalidDynamicSearchRuleDescription>, schema_type = Option<String>, skip_serializing_if = "Setting::is_not_set")]
+    pub description: Setting<String>,
+    /// Precedence of the dynamic search rule. Lower numeric values take precedence over higher
+    /// ones. If omitted, the rule is treated as having the lowest precedence. This precedence is
+    /// used to resolve conflicts between matching rules:
+    /// - If the same document is selected by multiple rules, the smallest `priority` number wins
+    /// - If different documents are pinned to the same position, they are ordered by ascending `priority`
+    #[request(default, error = DeserrJsonError<InvalidDynamicSearchRulePriority>, schema_type = Option<u64>, skip_serializing_if = "Setting::is_not_set")]
+    pub precedence: Setting<u64>,
+    /// Whether the dynamic search rule is active.
+    #[request(default, error = DeserrJsonError<InvalidDynamicSearchRuleActive>, schema_type = Option<bool>, skip_serializing_if = "Setting::is_not_set")]
+    pub active: Setting<bool>,
+    /// Conditions that must match before the dynamic search rule applies.
+    #[request(default, error = DeserrJsonError<InvalidDynamicSearchRuleConditions>, schema_type = Option<Conditions>, skip_serializing_if = "Setting::is_not_set")]
+    pub conditions: Setting<Conditions>,
+    /// Actions to apply when the dynamic search rule matches.
+    #[request(default, error = DeserrJsonError<InvalidDynamicSearchRuleActions>, schema_type = Option<RuleActions>, skip_serializing_if = "Setting::is_not_set")]
+    pub actions: Setting<RuleActions>,
+}
+
+impl DynamicSearchRuleUpdateRequest {
+    pub fn difference(&mut self, from: &Self) {
+        let Self { description, precedence, active, conditions, actions } = from;
+
+        self.description.difference(description);
+        self.precedence.difference(precedence);
+        self.active.difference(active);
+        self.conditions.difference(conditions);
+        self.actions.difference(actions);
+    }
+
+    pub fn from_v1_53(
+        legacy: milli::dynamic_search_rules::upgrade::v1_53::DynamicSearchRuleUpdateRequest,
+    ) -> Self {
+        let milli::dynamic_search_rules::upgrade::v1_53::DynamicSearchRuleUpdateRequest {
+            description,
+            precedence,
+            active,
+            conditions,
+            actions,
+        } = legacy;
+
+        let conditions = Self::from_v1_53_conditions(conditions);
+        let actions = Self::from_v1_53_actions(actions);
+
+        Self { description, precedence, active, conditions, actions }
+    }
+
+    fn from_v1_53_conditions(
+        legacy: Setting<milli::dynamic_search_rules::upgrade::v1_53::Conditions>,
+    ) -> Setting<Conditions> {
+        legacy.map(
+            |milli::dynamic_search_rules::upgrade::v1_53::Conditions { time, query, filter }| {
+                let time = time.map(|time| TimeCondition { start: time.start, end: time.end });
+                let query = query
+                    .map(|query| QueryCondition { is_empty: query.is_empty, words: query.words });
+                let filter = filter.map(|filter| FilterCondition { values: filter.values });
+                Conditions { time, query, filter }
+            },
+        )
+    }
+
+    fn from_v1_53_actions(
+        legacy: Setting<Vec<milli::dynamic_search_rules::upgrade::v1_53::RuleAction>>,
+    ) -> Setting<RuleActions> {
+        legacy.map(|actions| {
+            let pin: Vec<_> = actions.into_iter().map(|action| action.into_pin_action()).collect();
+            RuleActions { pin, scale: Default::default() }
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(rename_all = "camelCase")]
+pub struct DynamicSearchRuleTarget {
+    /// Rule object representing the currently processed state of this rule.
+    ///
+    /// `null` if the rule doesn't currently exist.
+    pub current: Option<DynamicSearchRuleUpdateRequest>,
+    /// Rule object representing the target processing state of this rule, as obtained by processing all tasks related to this rule.
+    ///
+    /// Only contains the fields that will be modified by the related tasks.
+    ///
+    /// `null` if the rule will no longer exist after processing all related tasks.
+    /// Empty object if the rule is left unmodified after processing all related tasks.
+    pub target: Option<DynamicSearchRuleUpdateRequest>,
+    /// List of the uids of the pending tasks that will update this DSR.
+    pub task_uids: Vec<TaskId>,
+    /// Set to `true` if there is at least one task that will update this DSR.
+    pub needs_processing: bool,
+}
+
+#[derive(Default)]
+pub struct Targets {
+    pub targeted_rules: BTreeMap<String, TargetOperation>,
+    pub task_uids: Vec<TaskId>,
+    pub clear_all: bool,
+}
+
+impl Targets {
+    pub fn update_rule<F, E>(
+        &mut self,
+        rule_uid: String,
+        task_id: TaskId,
+        in_db: F,
+    ) -> Result<(), E>
+    where
+        F: Fn(&str) -> Result<bool, E>,
+    {
+        self.register_rule_operation(rule_uid, task_id, in_db, false)
+    }
+
+    pub fn delete_rule<F, E>(
+        &mut self,
+        rule_uid: String,
+        task_id: TaskId,
+        in_db: F,
+    ) -> Result<(), E>
+    where
+        F: Fn(&str) -> Result<bool, E>,
+    {
+        self.register_rule_operation(rule_uid, task_id, in_db, true)
+    }
+
+    pub fn target_total_rule_count(&self, current_total_rule_count: usize) -> usize {
+        let mut new;
+        if self.clear_all {
+            new = 0usize;
+            for operation in self.targeted_rules.values() {
+                // db was reset and we count back from 0, so the original presence in db does not matter
+                match operation {
+                    TargetOperation::UpdateNewRule | TargetOperation::UpdateRuleInDb => {
+                        new = new.saturating_add(1)
+                    }
+                    // cannot have deletions from the db because the db was cleared already
+                    TargetOperation::DeleteNewRule | TargetOperation::DeleteRuleInDb => {}
+                }
+            }
+        } else {
+            new = current_total_rule_count;
+            for operation in self.targeted_rules.values() {
+                // only count newly created rules and existing rules that were deleted
+                match operation {
+                    TargetOperation::UpdateNewRule => new = new.saturating_add(1),
+                    TargetOperation::UpdateRuleInDb => {}
+                    TargetOperation::DeleteNewRule => {}
+                    TargetOperation::DeleteRuleInDb => new = new.saturating_sub(1),
+                }
+            }
+        }
+        new
+    }
+
+    pub fn needs_processing(&self, rule_uid: &str) -> bool {
+        self.clear_all || self.targeted_rules.contains_key(rule_uid)
+    }
+
+    pub fn task_uids(&self) -> &[TaskId] {
+        &self.task_uids
+    }
+
+    pub fn clear_rules(&mut self, task_id: TaskId) {
+        self.clear_all = true;
+        self.targeted_rules.clear();
+        self.task_uids.push(task_id);
+    }
+
+    fn register_rule_operation<F, E>(
+        &mut self,
+        rule_uid: String,
+        task_id: TaskId,
+        in_db: F,
+        is_deletion: bool,
+    ) -> Result<(), E>
+    where
+        F: Fn(&str) -> Result<bool, E>,
+    {
+        self.task_uids.push(task_id);
+        let operation = match self.targeted_rules.get(&rule_uid) {
+            // new rule
+            Some(TargetOperation::UpdateNewRule | TargetOperation::DeleteNewRule) => {
+                if is_deletion {
+                    TargetOperation::DeleteNewRule
+                } else {
+                    TargetOperation::UpdateNewRule
+                }
+            }
+
+            // in db rule
+            Some(TargetOperation::UpdateRuleInDb | TargetOperation::DeleteRuleInDb) => {
+                if is_deletion {
+                    TargetOperation::DeleteRuleInDb
+                } else {
+                    TargetOperation::UpdateRuleInDb
+                }
+            }
+
+            None => {
+                if in_db(&rule_uid)? {
+                    if is_deletion {
+                        TargetOperation::DeleteRuleInDb
+                    } else {
+                        TargetOperation::UpdateRuleInDb
+                    }
+                } else {
+                    if is_deletion {
+                        TargetOperation::DeleteNewRule
+                    } else {
+                        TargetOperation::UpdateNewRule
+                    }
+                }
+            }
+        };
+
+        self.targeted_rules.insert(rule_uid, operation);
+        Ok(())
+    }
+}
+
+pub enum TargetOperation {
+    UpdateNewRule,
+    UpdateRuleInDb,
+    DeleteNewRule,
+    DeleteRuleInDb,
+}
+
+#[routes::request(db, validate = validate_condition -> DeserrJsonError, override_error = DeserrJsonError<InvalidDynamicSearchRuleConditions>)]
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Conditions {
+    /// Time range where the rule is active
+    #[request(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<TimeCondition>,
+    /// Conditions on the search query that determines whether the rule is active
+    #[request(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryCondition>,
+    /// Conditions on the values matching the filter of the search query that determines whether the rule is active
+    #[request(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<FilterCondition>,
+}
+
+impl Conditions {
+    pub fn into_preview(self) -> milli::dynamic_search_rules::PreviewConditions {
+        let Self { time, query, filter } = self;
+        milli::dynamic_search_rules::PreviewConditions {
+            time: time.map(TimeCondition::into_preview),
+            query: query.map(QueryCondition::into_preview),
+            filter: filter.map(FilterCondition::into_preview),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, ToSchema, Deserr)]
+#[deserr(rename_all = camelCase)]
+#[serde(rename_all = "camelCase")]
+#[schema(rename_all = "camelCase")]
+pub struct TimeCondition {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    #[deserr(default, try_from(Option<String>) = parse_optional_rfc3339_datetime -> ParseOffsetDateTimeError)]
+    /// Start of the time range where this rule can be considered active.
+    ///
+    /// Specify as a RFC3339 datetime.
+    pub start: Option<OffsetDateTime>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    /// End of the time range where this rule can be considered active.
+    ///
+    /// Specify as a RFC3339 datetime.
+    #[deserr(default, try_from(Option<String>) = parse_optional_rfc3339_datetime -> ParseOffsetDateTimeError)]
+    pub end: Option<OffsetDateTime>,
+}
+
+impl TimeCondition {
+    pub fn into_preview(self) -> milli::dynamic_search_rules::PreviewTimeCondition {
+        let Self { start, end } = self;
+        milli::dynamic_search_rules::PreviewTimeCondition { start, end }
+    }
+}
+
+impl routes::RequestBody for TimeCondition {}
+
+#[routes::request(db, override_error = DeserrJsonError<InvalidDynamicSearchRuleConditions>)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryCondition {
+    /// If present and non-null, specifies either:
+    ///
+    /// - That this rule can only be active when the search query is empty
+    /// - That this rule can only be active when the search query is non-empty (contains at least one word)
+    #[request(default, skip_serializing_if = "Option::is_none")]
+    pub is_empty: Option<bool>,
+
+    /// If present and non-null, specifies that the rule can only be active if all the specified words are
+    /// present in the search query.
+    #[request(default, skip_serializing_if = "Option::is_none")]
+    pub words: Option<String>,
+}
+
+impl QueryCondition {
+    pub fn into_preview(self) -> milli::dynamic_search_rules::PreviewQueryCondition {
+        let Self { is_empty, words } = self;
+        milli::dynamic_search_rules::PreviewQueryCondition { is_empty, words }
+    }
+}
+
+#[routes::request(db, override_error = DeserrJsonError<InvalidDynamicSearchRuleConditions>)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterCondition {
+    #[request(default)]
+    pub values: BTreeMap<String, serde_json::Value>,
+}
+
+impl FilterCondition {
+    pub fn into_preview(self) -> milli::dynamic_search_rules::PreviewFilterCondition {
+        let Self { values } = self;
+        milli::dynamic_search_rules::PreviewFilterCondition { values }
+    }
+}
+
+// We manually check the exclusivity of `is_empty` and `contains` because Deserr does not support
+// untagged enums
+fn validate_condition<E: DeserializeError>(
+    conditions: Conditions,
+    location: ValuePointerRef,
+) -> Result<Conditions, E> {
+    // 1. check is_empty and words
+    if let Some(query) = &conditions.query {
+        if query.is_empty == Some(true) && query.words.is_some() {
+            return Err(deserr::take_cf_content(E::error::<Infallible>(
+                None,
+                ErrorKind::Unexpected {
+                    msg: "either `isEmpty` or `words` can be used, not both at once".to_string(),
+                },
+                location.push_key("query"),
+            )));
+        }
+    }
+
+    // 2. check that start is before end
+    if let Some(time) = &conditions.time {
+        if let Some((start, end)) = time.start.as_ref().zip(time.end.as_ref()) {
+            if start > end {
+                return Err(deserr::take_cf_content(E::error::<Infallible>(
+                    None,
+                    ErrorKind::Unexpected {
+                        msg: format!("`end` (`{end}`) should be later than `start` (`{start}`)"),
+                    },
+                    location.push_key("time"),
+                )));
+            }
+        }
+    }
+
+    Ok(conditions)
+}
+
+fn parse_optional_rfc3339_datetime(
+    value: Option<String>,
+) -> Result<Option<OffsetDateTime>, ParseOffsetDateTimeError> {
+    value
+        .map(|value| {
+            OffsetDateTime::parse(&value, &Rfc3339).map_err(|_| ParseOffsetDateTimeError(value))
+        })
+        .transpose()
+}
